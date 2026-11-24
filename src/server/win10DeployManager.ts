@@ -78,6 +78,7 @@ export interface Win10DeployState {
 
 export interface Win10DeployDependencies {
   rootDir?: string;
+  bakedRoot?: string;
   ensureToolchain?: () => Promise<{ ok: boolean; reason?: string; has7z: boolean; hasQemu: boolean; hasOvmf: boolean }>;
   downloadIso?: (
     destPath: string,
@@ -131,6 +132,7 @@ function isProcessAlive(pid: number): boolean {
 
 export class Win10DeployManager {
   private rootDir: string;
+  private bakedRoot: string;
   private dataDir: string;
   private storageType: 'persistent-volume' | 'workspace-data';
   private isoDir: string;
@@ -146,6 +148,7 @@ export class Win10DeployManager {
   constructor(deps: Win10DeployDependencies = {}) {
     this.deps = deps;
     this.rootDir = deps.rootDir || process.cwd();
+    this.bakedRoot = deps.bakedRoot || '/opt/moon-studio/win10-baked';
     const storageLoc = resolvePersistentStorageRoot(
       deps.rootDir ? { workspaceRoot: deps.rootDir } : undefined
     );
@@ -250,11 +253,42 @@ export class Win10DeployManager {
     }
   }
 
+  private resolveManifestArtifacts(manifest: Win10InstallerManifest): Win10InstallerManifest | null {
+    const isoCandidates = [
+      manifest.isoPath,
+      path.join(this.isoDir, WIN10_ISO_FILENAME),
+      path.join(this.rootDir, 'data', 'iso', WIN10_ISO_FILENAME),
+    ];
+    const dirCandidates = [
+      manifest.extractedDir,
+      this.extractedDir,
+      path.join(this.rootDir, 'data', 'installer', 'windows-10', 'files'),
+    ];
+    if (!this.deps.rootDir || this.deps.bakedRoot) {
+      isoCandidates.push(path.join(this.bakedRoot, 'iso', WIN10_ISO_FILENAME));
+      dirCandidates.push(path.join(this.bakedRoot, 'installer', 'windows-10', 'files'));
+    }
+
+    const resolvedIso = isoCandidates.find((p) => Boolean(p) && fs.existsSync(p));
+    const resolvedDir = dirCandidates.find((p) => Boolean(p) && fs.existsSync(p) && countFilesRecursive(p) > 0);
+    if (!resolvedIso || !resolvedDir) return null;
+
+    return {
+      ...manifest,
+      isoPath: resolvedIso,
+      extractedDir: resolvedDir,
+    };
+  }
+
   private readManifest(): Win10InstallerManifest | null {
     const candidates = [this.manifestPath];
-    if (!this.deps.rootDir) {
-      const bakedManifest = path.join(this.rootDir, 'data', 'installer', 'windows-10', 'manifest.json');
-      if (bakedManifest !== this.manifestPath) {
+    if (!this.deps.rootDir || this.deps.bakedRoot) {
+      const workspaceManifest = path.join(this.rootDir, 'data', 'installer', 'windows-10', 'manifest.json');
+      if (!candidates.includes(workspaceManifest)) {
+        candidates.push(workspaceManifest);
+      }
+      const bakedManifest = path.join(this.bakedRoot, 'installer', 'windows-10', 'manifest.json');
+      if (!candidates.includes(bakedManifest)) {
         candidates.push(bakedManifest);
       }
     }
@@ -263,7 +297,8 @@ export class Win10DeployManager {
         if (!fs.existsSync(cand)) continue;
         const raw = JSON.parse(fs.readFileSync(cand, 'utf8'));
         if (raw && typeof raw === 'object' && raw.ready === true) {
-          return raw as Win10InstallerManifest;
+          const resolved = this.resolveManifestArtifacts(raw as Win10InstallerManifest);
+          if (resolved) return resolved;
         }
       } catch {
         // ignore

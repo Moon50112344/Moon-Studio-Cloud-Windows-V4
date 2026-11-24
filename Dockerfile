@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 
 # ==============================================================================
-# Stage 1: iso-downloader (No /dev/kvm required)
+# Stage 1: iso-downloader (Runs concurrently with Debian/runtime install under BuildKit)
 # Downloads, SHA-256 verifies & extracts Windows 10 IoT Enterprise LTSC 2021
-# (plus optional Windows 7) during `docker build -t moon-studio .`
+# DURING `docker build -t moon-studio .` (so `docker run` never downloads ISO).
 # ==============================================================================
 FROM debian:bookworm-slim AS iso-downloader
 
@@ -29,6 +29,8 @@ ISO_DIR="${ISO_DIR:-/app/data/iso}"
 INSTALLER_DIR="${INSTALLER_DIR:-/app/data/installer/windows-10}"
 mkdir -p "$ISO_DIR" "$INSTALLER_DIR/files"
 
+MATCHED_SHA=""
+
 verify_sha256() {
   local file="$1"
   local expected="$2"
@@ -49,18 +51,20 @@ download_with_fallback() {
   local dest="$1"
   shift
   local tmp="${dest}.downloading"
+  MATCHED_SHA=""
   while [ "$#" -ge 2 ]; do
     local url="$1"
     local sha="$2"
     shift 2
-    echo "[Dockerfile-ISO] Attempting download (resumable, no /dev/kvm needed): $url -> $dest"
-    if curl -fL -sS -C - --connect-timeout 15 --speed-time 45 --speed-limit 1024 \
-         --retry 3 --retry-delay 3 \
+    echo "[Dockerfile-ISO] Downloading during docker build (parallel with Debian, no /dev/kvm needed): $url -> $dest"
+    if curl -fL --progress-bar -C - --connect-timeout 20 --speed-time 90 --speed-limit 512 \
+         --retry 5 --retry-delay 5 --retry-all-errors \
          -A "Mozilla/5.0 (X11; Linux x86_64) dockurr-windows/1.0" \
          -o "$tmp" "$url"; then
-      if [ -s "$tmp" ] && 7z l -ba "$tmp" 2>/dev/null | grep -qiE "install\.(wim|esd|swm)" && verify_sha256 "$tmp" "$sha"; then
+      if [ -s "$tmp" ] && 7z l "$tmp" 2>/dev/null | grep -qiE "install\.(wim|esd|swm)" && verify_sha256 "$tmp" "$sha"; then
         mv "$tmp" "$dest"
-        echo "[Dockerfile-ISO] Verified genuine Windows ISO: $dest"
+        MATCHED_SHA="$sha"
+        echo "[Dockerfile-ISO] Verified genuine Windows ISO during build: $dest"
         return 0
       fi
       echo "[Dockerfile-ISO] Downloaded file failed Windows ISO/SHA-256 verification, trying next mirror..."
@@ -74,13 +78,22 @@ download_with_fallback() {
 
 prepare_win10_manifest() {
   local iso="$1"
+  local expected_sha="$2"
   local actual_sha size_bytes count
   actual_sha=$(sha256sum "$iso" | awk '{print tolower($1)}')
+  if [ -z "$expected_sha" ]; then
+    expected_sha="$actual_sha"
+  fi
   size_bytes=$(stat -c %s "$iso")
 
   echo "[Dockerfile-ISO] Extracting Windows 10 setup payload into $INSTALLER_DIR/files..."
   7z x -y "-o${INSTALLER_DIR}/files" "$iso" \
     'boot/*' 'efi/*' 'setup.exe' 'autorun.inf' 'sources/boot.wim' 'sources/lang.ini' 'sources/ei.cfg' >/dev/null || true
+
+  if [ ! -s "${INSTALLER_DIR}/files/sources/boot.wim" ] && [ ! -s "${INSTALLER_DIR}/files/setup.exe" ]; then
+    echo "[Dockerfile-ISO] Extraction check failed: missing boot.wim and setup.exe in ${INSTALLER_DIR}/files"
+    return 1
+  fi
 
   count=$(find "${INSTALLER_DIR}/files" -type f | wc -l)
   local now
@@ -93,7 +106,7 @@ prepare_win10_manifest() {
   "arch": "x64",
   "isoPath": "${iso}",
   "isoSizeBytes": ${size_bytes},
-  "sha256Expected": "a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160",
+  "sha256Expected": "${expected_sha}",
   "sha256Actual": "${actual_sha}",
   "checksumVerified": true,
   "extractedDir": "${INSTALLER_DIR}/files",
@@ -117,7 +130,7 @@ case "$OS_ID" in
       "a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160" \
       "https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96_202302/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso" \
       "c90a6df8997bf49e56b9673982f3e80745058723a707aef8f22998ae6479597d"
-    prepare_win10_manifest "$ISO_FILE"
+    prepare_win10_manifest "$ISO_FILE" "$MATCHED_SHA"
     ;;
   windows-7|7u)
     download_with_fallback "${ISO_DIR}/windows-7-sp1-x64.iso" \
@@ -141,14 +154,15 @@ CMD ["bash", "-c", "echo 'Use: download-windows-iso.sh windows-10 | windows-7'"]
 
 # ==============================================================================
 # Stage 2: runtime (Moon Studio Cloud — TCG / KVM=N compatible, port 8080)
-# Runs Debian 12 + Windows 10 IoT Enterprise LTSC 2021 without requiring /dev/kvm.
-# `docker build -t moon-studio .` bakes verified Win10 ISO + READY manifest.
-# `docker run -d --name moon-studio -p 8080:8080 --restart unless-stopped moon-studio`
-# launches immediately on port 8080 and pre-installs base QCOW2 automatically.
+# Installs Debian 12 desktop + QEMU alongside parallel Win10 ISO stage,
+# verifies baked Win10 manifest READY inside `docker build -t moon-studio .`
+# so `docker run -d --name moon-studio -p 8080:8080 --restart unless-stopped moon-studio`
+# starts with Debian 12 + Windows 10 ISO already READY (0 ISO download at runtime).
 # ==============================================================================
 FROM node:22-bookworm-slim AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG DOWNLOAD_WIN10=true
 ARG PREINSTALL_WIN10=false
 
 ENV NODE_ENV=production \
@@ -193,7 +207,10 @@ COPY --from=iso-downloader /app/data/iso /app/data/iso
 COPY --from=iso-downloader /app/data/installer /app/data/installer
 
 RUN npm run build && \
-    mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso /app/data/installer/windows-10/files && \
+    mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso /app/data/installer/windows-10/files /opt/moon-studio/win10-baked && \
+    cp -al /app/data/iso /opt/moon-studio/win10-baked/iso && \
+    cp -al /app/data/installer /opt/moon-studio/win10-baked/installer && \
+    if [ "$DOWNLOAD_WIN10" = "true" ]; then npx tsx scripts/verify-win10-baked.ts; fi && \
     if [ "$PREINSTALL_WIN10" = "true" ]; then npx tsx scripts/preinstall-win10-base.ts; fi
 
 EXPOSE 8080 3389

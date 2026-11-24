@@ -80,6 +80,13 @@ test('Dockerfile and docker-compose.yml support ISO download and runtime without
   assert.ok(dockerfile.includes('COPY --from=iso-downloader /app/data/installer /app/data/installer'));
   assert.ok(dockerfile.includes('manifest.json'));
   assert.ok(dockerfile.includes('scripts/preinstall-win10-base.ts'));
+  assert.ok(dockerfile.includes('scripts/verify-win10-baked.ts'));
+  assert.ok(dockerfile.includes('/opt/moon-studio/win10-baked'));
+  assert.ok(dockerfile.includes('MATCHED_SHA'));
+  assert.equal(dockerfile.includes('7z l -ba'), false);
+
+  const dockerignore = fs.readFileSync(path.join(process.cwd(), '.dockerignore'), 'utf8');
+  assert.ok(dockerignore.split(/\r?\n/).some((line) => line.trim() === 'data'));
 
   const compose = fs.readFileSync(path.join(process.cwd(), 'docker-compose.yml'), 'utf8');
   assert.equal(compose.includes('/dev/kvm'), false);

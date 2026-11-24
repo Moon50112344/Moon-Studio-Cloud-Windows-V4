@@ -322,4 +322,70 @@ test('buildWindowsAutounattendXml and buildCredentialSyncScript configure sealed
   assert.ok(syncScript.includes('remote desktop'));
 });
 
+test('Win10DeployManager restores READY immediately from /opt/moon-studio/win10-baked even if runtime data volume is empty', async () => {
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'win10-baked-root-'));
+  const runtimeWorkspace = path.join(tmpRoot, 'runtime-ws');
+  const bakedRoot = path.join(tmpRoot, 'win10-baked');
+  const expectedSha = DOCKUR_MIRROR_CATALOG['windows-10'][1].sha256!;
+
+  try {
+    fs.mkdirSync(path.join(runtimeWorkspace, 'data'), { recursive: true });
+    fs.mkdirSync(path.join(bakedRoot, 'iso'), { recursive: true });
+    fs.mkdirSync(path.join(bakedRoot, 'installer', 'windows-10', 'files', 'sources'), { recursive: true });
+
+    const bakedIsoPath = path.join(bakedRoot, 'iso', 'windows-10-iot-ltsc-2021-x64.iso');
+    const fd = fs.openSync(bakedIsoPath, 'w');
+    fs.ftruncateSync(fd, 600 * 1024 * 1024);
+    fs.closeSync(fd);
+
+    const bakedFilesDir = path.join(bakedRoot, 'installer', 'windows-10', 'files');
+    fs.writeFileSync(path.join(bakedFilesDir, 'sources', 'boot.wim'), 'boot');
+
+    fs.writeFileSync(
+      path.join(bakedRoot, 'installer', 'windows-10', 'manifest.json'),
+      JSON.stringify({
+        ready: true,
+        edition: 'Windows 10 IoT Enterprise LTSC 2021 (x64)',
+        arch: 'x64',
+        isoPath: '/app/data/iso/windows-10-iot-ltsc-2021-x64.iso', // simulates image build path masked by mount
+        isoSizeBytes: 600 * 1024 * 1024,
+        sha256Expected: expectedSha,
+        sha256Actual: expectedSha,
+        checksumVerified: true,
+        extractedDir: '/app/data/installer/windows-10/files',
+        extractionMode: 'boot-payload-plus-shared-iso',
+        extractedFilesCount: 1,
+        wimIndex: 2,
+        wimEdition: 'Windows 10 IoT Enterprise LTSC',
+        hypervisorMode: 'tcg',
+        storageType: 'workspace-data',
+        preparedAt: new Date().toISOString(),
+      }),
+      'utf8'
+    );
+
+    let downloadedAtRuntime = false;
+    const mgr = new Win10DeployManager({
+      rootDir: runtimeWorkspace,
+      bakedRoot,
+      downloadIso: async () => {
+        downloadedAtRuntime = true;
+        throw new Error('Must NOT re-download baked ISO at runtime');
+      },
+    });
+
+    assert.equal(mgr.isReady(), true);
+    const state = mgr.getState();
+    assert.equal(state.status, 'READY');
+    assert.equal(state.resumeMode, 'cached');
+    assert.equal(state.isoPath, bakedIsoPath);
+    assert.equal(state.extractedDir, bakedFilesDir);
+    await mgr.startBackgroundPreparation();
+    assert.equal(downloadedAtRuntime, false);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+
 

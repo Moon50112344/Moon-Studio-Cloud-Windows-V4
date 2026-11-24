@@ -5,14 +5,17 @@
 # Downloads & verifies genuine Windows 10 / Windows 7 ISOs via dockurr/windows
 # mirrors using pure HTTP/TLS curl + 7z verification.
 #
-# Usage (optional prefetch during build):
+# Windows 10 ISO is included in the runtime image by default, so startup preparation
+# can verify/extract it without downloading after the web app opens.
+# Opt out of the large build-time download with --build-arg DOWNLOAD_WIN10=false.
+# Usage (optional Windows 7 prefetch):
 #   docker build --target iso-downloader --build-arg DOWNLOAD_WIN7=true -t moon-iso .
 #   docker compose --profile iso run --rm iso-downloader windows-10
 # ==============================================================================
 FROM debian:bookworm-slim AS iso-downloader
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG DOWNLOAD_WIN10=false
+ARG DOWNLOAD_WIN10=true
 ARG DOWNLOAD_WIN7=false
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -85,12 +88,12 @@ CMD ["bash", "-c", "echo 'Use: download-windows-iso.sh windows-10 | windows-7'"]
 # Runs without requiring /dev/kvm: auto-downloads ISOs via dockurr/windows
 # mirrors and executes QEMU x86_64 + OVMF + swtpm + XFCE4/xrdp.
 # ==============================================================================
-FROM node:22-bookworm-slim AS runtime
+FROM oven/bun:1 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
 
 ENV NODE_ENV=production \
-    PORT=3000 \
+    PORT=8080 \
     KVM=N \
     ACCEL=tcg
 
@@ -114,14 +117,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY package.json bun.lock* package-lock.json* ./
-RUN npm install --no-audit --no-fund
+RUN bun install --frozen-lockfile
 
 COPY . .
 COPY --from=iso-downloader /usr/local/bin/download-windows-iso.sh /usr/local/bin/download-windows-iso.sh
 COPY --from=iso-downloader /app/data/iso /app/data/iso
 
-RUN npm run build && mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso
+RUN bun run build && mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso
 
-EXPOSE 3000 3389
+EXPOSE 8080 3389
 
-CMD ["npm", "start"]
+CMD ["bun", "run", "start"]

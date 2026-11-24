@@ -11,6 +11,7 @@ import {
   getOrderedMirrorsForOs,
 } from './dockurEngine';
 import { evaluateIsoChecksum } from './win7Lifecycle';
+import { resolvePersistentStorageRoot } from './storagePath';
 
 export type SupportedOsId = 'debian-12' | 'windows-10' | 'windows-7';
 
@@ -105,8 +106,9 @@ export class ImageManager {
   private inflightEnsures: Map<SupportedOsId, Promise<string>> = new Map();
 
   constructor() {
-    this.isoDir = path.resolve(process.cwd(), 'data/iso');
-    this.disksDir = path.resolve(process.cwd(), 'data/disks');
+    const dataDir = resolvePersistentStorageRoot().dataDir;
+    this.isoDir = path.join(dataDir, 'iso');
+    this.disksDir = path.join(dataDir, 'disks');
     this.metadataPath = path.join(this.isoDir, '.iso-metadata.json');
     try {
       fs.mkdirSync(this.isoDir, { recursive: true });

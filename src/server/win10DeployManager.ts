@@ -251,14 +251,23 @@ export class Win10DeployManager {
   }
 
   private readManifest(): Win10InstallerManifest | null {
-    try {
-      if (!fs.existsSync(this.manifestPath)) return null;
-      const raw = JSON.parse(fs.readFileSync(this.manifestPath, 'utf8'));
-      if (raw && typeof raw === 'object' && raw.ready === true) {
-        return raw as Win10InstallerManifest;
+    const candidates = [this.manifestPath];
+    if (!this.deps.rootDir) {
+      const bakedManifest = path.join(this.rootDir, 'data', 'installer', 'windows-10', 'manifest.json');
+      if (bakedManifest !== this.manifestPath) {
+        candidates.push(bakedManifest);
       }
-    } catch {
-      // ignore
+    }
+    for (const cand of candidates) {
+      try {
+        if (!fs.existsSync(cand)) continue;
+        const raw = JSON.parse(fs.readFileSync(cand, 'utf8'));
+        if (raw && typeof raw === 'object' && raw.ready === true) {
+          return raw as Win10InstallerManifest;
+        }
+      } catch {
+        // ignore
+      }
     }
     return null;
   }

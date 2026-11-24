@@ -73,11 +73,20 @@ test('Dockerfile and docker-compose.yml support ISO download and runtime without
   assert.ok(dockerfile.includes('AS runtime'));
   assert.ok(dockerfile.includes('KVM=N'));
   assert.ok(dockerfile.includes('download-windows-iso.sh'));
+  assert.ok(dockerfile.includes('ARG DOWNLOAD_WIN10=true'));
+  assert.ok(dockerfile.includes('ARG PREINSTALL_WIN10=false'));
+  assert.ok(dockerfile.includes('PORT=8080'));
+  assert.ok(dockerfile.includes('EXPOSE 8080 3389'));
+  assert.ok(dockerfile.includes('COPY --from=iso-downloader /app/data/installer /app/data/installer'));
+  assert.ok(dockerfile.includes('manifest.json'));
+  assert.ok(dockerfile.includes('scripts/preinstall-win10-base.ts'));
 
   const compose = fs.readFileSync(path.join(process.cwd(), 'docker-compose.yml'), 'utf8');
   assert.equal(compose.includes('/dev/kvm'), false);
   assert.ok(compose.includes('KVM: "N"'));
   assert.ok(compose.includes('dockerfile: Dockerfile'));
+  assert.ok(compose.includes('DOWNLOAD_WIN10: "true"'));
+  assert.ok(compose.includes('PORT: "8080"'));
 });
 
 test('planPartialIsoAction selects start-fresh, resume-range, restart-fresh, and promote accurately', () => {

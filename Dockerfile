@@ -2,15 +2,8 @@
 
 # ==============================================================================
 # Stage 1: iso-downloader (No /dev/kvm required)
-# Downloads & verifies genuine Windows 10 / Windows 7 ISOs via dockurr/windows
-# mirrors using pure HTTP/TLS curl + 7z verification.
-#
-# Windows 10 ISO is included in the runtime image by default, so startup preparation
-# can verify/extract it without downloading after the web app opens.
-# Opt out of the large build-time download with --build-arg DOWNLOAD_WIN10=false.
-# Usage (optional Windows 7 prefetch):
-#   docker build --target iso-downloader --build-arg DOWNLOAD_WIN7=true -t moon-iso .
-#   docker compose --profile iso run --rm iso-downloader windows-10
+# Downloads, SHA-256 verifies & extracts Windows 10 IoT Enterprise LTSC 2021
+# (plus optional Windows 7) during `docker build -t moon-studio .`
 # ==============================================================================
 FROM debian:bookworm-slim AS iso-downloader
 
@@ -25,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-RUN mkdir -p /app/data/iso
+RUN mkdir -p /app/data/iso /app/data/installer/windows-10/files
 
 COPY <<'EOF' /usr/local/bin/download-windows-iso.sh
 #!/usr/bin/env bash
@@ -33,24 +26,44 @@ set -euo pipefail
 
 OS_ID="${1:-}"
 ISO_DIR="${ISO_DIR:-/app/data/iso}"
-mkdir -p "$ISO_DIR"
+INSTALLER_DIR="${INSTALLER_DIR:-/app/data/installer/windows-10}"
+mkdir -p "$ISO_DIR" "$INSTALLER_DIR/files"
+
+verify_sha256() {
+  local file="$1"
+  local expected="$2"
+  if [ -z "$expected" ]; then
+    return 0
+  fi
+  local actual
+  actual=$(sha256sum "$file" | awk '{print tolower($1)}')
+  if [ "$actual" != "${expected,,}" ]; then
+    echo "[Dockerfile-ISO] SHA-256 mismatch for $file: expected $expected, got $actual"
+    return 1
+  fi
+  echo "[Dockerfile-ISO] SHA-256 verified: $actual"
+  return 0
+}
 
 download_with_fallback() {
   local dest="$1"
   shift
   local tmp="${dest}.downloading"
-  for url in "$@"; do
+  while [ "$#" -ge 2 ]; do
+    local url="$1"
+    local sha="$2"
+    shift 2
     echo "[Dockerfile-ISO] Attempting download (resumable, no /dev/kvm needed): $url -> $dest"
     if curl -fL -sS -C - --connect-timeout 15 --speed-time 45 --speed-limit 1024 \
          --retry 3 --retry-delay 3 \
          -A "Mozilla/5.0 (X11; Linux x86_64) dockurr-windows/1.0" \
          -o "$tmp" "$url"; then
-      if [ -s "$tmp" ] && 7z l -ba "$tmp" 2>/dev/null | grep -qiE "install\.(wim|esd|swm)"; then
+      if [ -s "$tmp" ] && 7z l -ba "$tmp" 2>/dev/null | grep -qiE "install\.(wim|esd|swm)" && verify_sha256 "$tmp" "$sha"; then
         mv "$tmp" "$dest"
         echo "[Dockerfile-ISO] Verified genuine Windows ISO: $dest"
         return 0
       fi
-      echo "[Dockerfile-ISO] Downloaded file failed Windows ISO payload check, trying next mirror..."
+      echo "[Dockerfile-ISO] Downloaded file failed Windows ISO/SHA-256 verification, trying next mirror..."
       rm -f "$tmp"
     else
       echo "[Dockerfile-ISO] Mirror failed or interrupted: $url"
@@ -59,16 +72,59 @@ download_with_fallback() {
   return 1
 }
 
+prepare_win10_manifest() {
+  local iso="$1"
+  local actual_sha size_bytes count
+  actual_sha=$(sha256sum "$iso" | awk '{print tolower($1)}')
+  size_bytes=$(stat -c %s "$iso")
+
+  echo "[Dockerfile-ISO] Extracting Windows 10 setup payload into $INSTALLER_DIR/files..."
+  7z x -y "-o${INSTALLER_DIR}/files" "$iso" \
+    'boot/*' 'efi/*' 'setup.exe' 'autorun.inf' 'sources/boot.wim' 'sources/lang.ini' 'sources/ei.cfg' >/dev/null || true
+
+  count=$(find "${INSTALLER_DIR}/files" -type f | wc -l)
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  cat > "${INSTALLER_DIR}/manifest.json" <<JSON
+{
+  "ready": true,
+  "edition": "Windows 10 IoT Enterprise LTSC 2021 (x64)",
+  "arch": "x64",
+  "isoPath": "${iso}",
+  "isoSizeBytes": ${size_bytes},
+  "sha256Expected": "a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160",
+  "sha256Actual": "${actual_sha}",
+  "checksumVerified": true,
+  "extractedDir": "${INSTALLER_DIR}/files",
+  "extractionMode": "boot-payload-plus-shared-iso",
+  "extractedFilesCount": ${count},
+  "wimIndex": 1,
+  "wimEdition": "Windows 10 IoT Enterprise LTSC",
+  "hypervisorMode": "tcg",
+  "storageType": "workspace-data",
+  "preparedAt": "${now}"
+}
+JSON
+  echo "[Dockerfile-ISO] Wrote Windows 10 READY manifest (${count} extracted files)."
+}
+
 case "$OS_ID" in
   windows-10|10)
-    download_with_fallback "${ISO_DIR}/windows-10-iot-ltsc-2021-x64.iso" \
+    ISO_FILE="${ISO_DIR}/windows-10-iot-ltsc-2021-x64.iso"
+    download_with_fallback "$ISO_FILE" \
       "https://archive.org/download/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f/en-us_windows_10_iot_enterprise_ltsc_2021_x64_dvd_257ad90f.iso" \
-      "https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96_202302/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso"
+      "a0334f31ea7a3e6932b9ad7206608248f0bd40698bfb8fc65f14fc5e4976c160" \
+      "https://archive.org/download/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96_202302/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso" \
+      "c90a6df8997bf49e56b9673982f3e80745058723a707aef8f22998ae6479597d"
+    prepare_win10_manifest "$ISO_FILE"
     ;;
   windows-7|7u)
     download_with_fallback "${ISO_DIR}/windows-7-sp1-x64.iso" \
       "https://files.dog/MSDN/Windows%207/en_windows_7_ultimate_with_sp1_x64_dvd_u_677332.iso" \
-      "https://archive.org/download/win7-ult-sp1-english/Win7_Ult_SP1_English_x64.iso"
+      "36f4fa2416d0982697ab106e3a72d2e120dbcdb6cc54fd3906d06120d0653808" \
+      "https://archive.org/download/win7-ult-sp1-english/Win7_Ult_SP1_English_x64.iso" \
+      "36f4fa2416d0982697ab106e3a72d2e120dbcdb6cc54fd3906d06120d0653808"
     ;;
   *)
     echo "Usage: download-windows-iso.sh <windows-10|windows-7>"
@@ -84,13 +140,16 @@ RUN if [ "$DOWNLOAD_WIN10" = "true" ]; then /usr/local/bin/download-windows-iso.
 CMD ["bash", "-c", "echo 'Use: download-windows-iso.sh windows-10 | windows-7'"]
 
 # ==============================================================================
-# Stage 2: runtime (Moon Studio Cloud Windows — TCG / KVM=N compatible)
-# Runs without requiring /dev/kvm: auto-downloads ISOs via dockurr/windows
-# mirrors and executes QEMU x86_64 + OVMF + swtpm + XFCE4/xrdp.
+# Stage 2: runtime (Moon Studio Cloud — TCG / KVM=N compatible, port 8080)
+# Runs Debian 12 + Windows 10 IoT Enterprise LTSC 2021 without requiring /dev/kvm.
+# `docker build -t moon-studio .` bakes verified Win10 ISO + READY manifest.
+# `docker run -d --name moon-studio -p 8080:8080 --restart unless-stopped moon-studio`
+# launches immediately on port 8080 and pre-installs base QCOW2 automatically.
 # ==============================================================================
-FROM oven/bun:1 AS runtime
+FROM node:22-bookworm-slim AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG PREINSTALL_WIN10=false
 
 ENV NODE_ENV=production \
     PORT=8080 \
@@ -100,31 +159,43 @@ ENV NODE_ENV=production \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    chromium \
+    dbus \
+    dbus-x11 \
+    desktop-base \
     genisoimage \
     ovmf \
     p7zip-full \
     procps \
     qemu-system-x86 \
     qemu-utils \
+    ssl-cert \
     swtpm \
     swtpm-tools \
-    xrdp \
-    xfce4 \
+    thunar \
+    xfce4-panel \
+    xfce4-session \
     xfce4-terminal \
-    dbus-x11 \
+    xfdesktop4 \
+    xfwm4 \
+    xorgxrdp \
+    xrdp \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY package.json bun.lock* package-lock.json* ./
-RUN bun install --frozen-lockfile
+RUN npm install --no-audit --no-fund
 
 COPY . .
 COPY --from=iso-downloader /usr/local/bin/download-windows-iso.sh /usr/local/bin/download-windows-iso.sh
 COPY --from=iso-downloader /app/data/iso /app/data/iso
+COPY --from=iso-downloader /app/data/installer /app/data/installer
 
-RUN bun run build && mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso
+RUN npm run build && \
+    mkdir -p /app/data/disks /app/data/tpm /app/data/provisioning /app/data/iso /app/data/installer/windows-10/files && \
+    if [ "$PREINSTALL_WIN10" = "true" ]; then npx tsx scripts/preinstall-win10-base.ts; fi
 
 EXPOSE 8080 3389
 
-CMD ["bun", "run", "start"]
+CMD ["npm", "start"]

@@ -3,6 +3,7 @@ import { X, Plus, Cpu, HardDrive, Layers, AlertTriangle, ShieldCheck, RefreshCw,
 import { OsSelector } from './OsSelector';
 import { SupportedOsId, OsDefinition } from '../server/imageManager';
 import type { Win10DeployState } from '../server/win10DeployManager';
+import type { Win10BasePreinstallState } from '../server/win10BasePreinstaller';
 import type { HostResourceSnapshot } from '../server/resourceManager';
 
 interface ImagePreflightItem {
@@ -48,6 +49,7 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
   const [error, setError] = useState<string | null>(null);
   const [imageStatuses, setImageStatuses] = useState<Record<string, ImagePreflightItem>>({});
   const [win10Installer, setWin10Installer] = useState<Win10DeployState | null>(null);
+  const [win10BaseImage, setWin10BaseImage] = useState<Win10BasePreinstallState | null>(null);
   const [hostResources, setHostResources] = useState<HostResourceSnapshot | null>(null);
   const [kvmAvailable, setKvmAvailable] = useState<boolean | null>(null);
   const [hostMemInfo, setHostMemInfo] = useState<{ total: string; available: string } | null>(null);
@@ -76,6 +78,9 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
       const json = await res.json();
       if (json?.success && json.installer) {
         setWin10Installer(json.installer);
+      }
+      if (json?.success && json.baseImage) {
+        setWin10BaseImage(json.baseImage);
       }
     } catch {
       // ignore
@@ -147,7 +152,9 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
     selectedMedia?.status === 'DOWNLOADING' || selectedMedia?.status === 'VERIFYING';
   const isWin10Preparing =
     selectedOs === 'windows-10' &&
-    (!win10Installer || (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED'));
+    (!win10Installer ||
+      (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED') ||
+      win10BaseImage?.status === 'INSTALLING_BASE');
 
   useEffect(() => {
     if (!isOpen || (!isDownloadingOrVerifying && !isWin10Preparing)) return;
@@ -311,11 +318,23 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
                     </div>
                     <p>
                       {win10Installer?.status === 'READY'
-                        ? `Bộ cài đã được chuẩn bị sẵn khi server khởi động. Tạo VM sẽ dùng trực tiếp bộ cài này (không tải lại hay giải nén lại), chạy QEMU Q35 + UEFI OVMF (${win10Installer.hypervisorMode === 'kvm' ? 'KVM' : 'TCG — không dùng /dev/kvm'}).`
+                        ? win10BaseImage?.ready
+                          ? `Bộ cài và ảnh đĩa gốc (windows-10-base.qcow2) đã sẵn sàng khi khởi động server. Tạo VM mới sẽ clone QCOW2 tức thì (không cài lại từ đầu), chạy QEMU Q35 + UEFI OVMF (${win10Installer.hypervisorMode === 'kvm' ? 'KVM' : 'TCG — không dùng /dev/kvm'}).`
+                          : `Bộ cài đã được chuẩn bị sẵn khi server khởi động. Tạo VM sẽ dùng trực tiếp bộ cài này (không tải lại hay giải nén lại), chạy QEMU Q35 + UEFI OVMF (${win10Installer.hypervisorMode === 'kvm' ? 'KVM' : 'TCG — không dùng /dev/kvm'}).`
                         : win10Installer?.status === 'FAILED'
                         ? `Chuẩn bị bộ cài khi khởi động server gặp lỗi tại bước ${win10Installer.failedStage || 'trước đó'}: ${win10Installer.error || 'Unknown error'}`
                         : `Đang tự động chuẩn bị nền trong Server Startup (${win10Installer?.progressPercent ?? 0}%). Chờ đạt trạng thái "READY" để tạo máy ảo (Debian 12 vẫn dùng bình thường ngay lúc này).`}
                     </p>
+                    {win10BaseImage && (
+                      <p className="text-[11px] font-mono text-[#8a99ad]" title={win10BaseImage.message}>
+                        Base QCOW2:{' '}
+                        <span className={win10BaseImage.ready ? 'text-emerald-300' : 'text-amber-300/90'}>
+                          {win10BaseImage.status}
+                        </span>
+                        {' — '}
+                        {win10BaseImage.message}
+                      </p>
+                    )}
                     {win10Installer?.sha256Expected && (
                       <p className="text-[11px] font-mono text-[#8a99ad] truncate max-w-xl" title={win10Installer.sha256Expected}>
                         SHA-256 chính thức: {win10Installer.sha256Expected.slice(0, 28)}...

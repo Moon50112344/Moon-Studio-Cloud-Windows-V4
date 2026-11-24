@@ -41,6 +41,7 @@ import { VmDisplayViewer } from './components/VmDisplayViewer';
 import { FileUploadManager } from './components/FileUploadManager';
 
 import type { Win10DeployState } from './server/win10DeployManager';
+import type { Win10BasePreinstallState } from './server/win10BasePreinstaller';
 import type { HostResourceSnapshot } from './server/resourceManager';
 
 interface ConnectionInfo {
@@ -105,6 +106,7 @@ export default function App() {
   const [isReloadingIp, setIsReloadingIp] = useState<boolean>(false);
   const [reloadSuccessMsg, setReloadSuccessMsg] = useState<string | null>(null);
   const [win10Installer, setWin10Installer] = useState<Win10DeployState | null>(null);
+  const [win10BaseImage, setWin10BaseImage] = useState<Win10BasePreinstallState | null>(null);
   const [showWin10Logs, setShowWin10Logs] = useState<boolean>(false);
   const [hostResources, setHostResources] = useState<HostResourceSnapshot | null>(null);
 
@@ -202,6 +204,9 @@ export default function App() {
         if (json.success && json.installer) {
           setWin10Installer(json.installer);
         }
+        if (json.success && json.baseImage) {
+          setWin10BaseImage(json.baseImage);
+        }
       }
     } catch {
       // ignore
@@ -230,15 +235,19 @@ export default function App() {
     fetchHostResources();
   }, []);
 
-  // Read-only polling of Server Startup Win10 installer status while preparation is active
+  // Read-only polling of Server Startup Win10 installer & base QCOW2 preinstall status
   useEffect(() => {
-    if (!win10Installer || (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED')) {
+    if (
+      !win10Installer ||
+      (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED') ||
+      win10BaseImage?.status === 'INSTALLING_BASE'
+    ) {
       const timer = setInterval(() => {
         fetchWin10InstallerStatus();
       }, 2500);
       return () => clearInterval(timer);
     }
-  }, [win10Installer?.status]);
+  }, [win10Installer?.status, win10BaseImage?.status]);
 
   // Poll host RAM/CPU telemetry every 5s
   useEffect(() => {
@@ -493,6 +502,32 @@ export default function App() {
                 <p className="text-[11px] text-[#8a99ad] truncate" title={win10Installer.stageDetail}>
                   {win10Installer.stageDetail}
                 </p>
+              )}
+
+              {win10BaseImage && (
+                <div
+                  data-testid="win10-base-image-status"
+                  className="flex items-center justify-between gap-2 text-[11px] font-mono pt-0.5 text-[#8a99ad]"
+                >
+                  <span className="truncate" title={win10BaseImage.message}>
+                    Base QCOW2:{' '}
+                    <strong
+                      className={
+                        win10BaseImage.ready
+                          ? 'text-emerald-300'
+                          : win10BaseImage.status === 'INSTALLING_BASE'
+                          ? 'text-[#2f8bff]'
+                          : 'text-amber-300/90'
+                      }
+                    >
+                      {win10BaseImage.ready
+                        ? 'READY (Clone tức thì)'
+                        : win10BaseImage.status === 'INSTALLING_BASE'
+                        ? 'Đang cài đặt nền tự động...'
+                        : win10BaseImage.status}
+                    </strong>
+                  </span>
+                </div>
               )}
 
               {win10Installer?.error && (

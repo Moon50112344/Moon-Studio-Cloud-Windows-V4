@@ -454,6 +454,7 @@ export class DockurEngine {
       provider: string;
       edition: string;
       stage?: 'downloading' | 'verifying';
+      resumeMode?: 'fresh' | 'range-resume';
     }) => void
   ): Promise<DockurMirrorCandidate & { sha256Actual?: string; checksumVerified?: boolean }> {
     const existingPromise = this.activeDownloadPromises.get(osId);

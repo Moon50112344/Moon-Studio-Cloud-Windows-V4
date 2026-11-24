@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { Win10DeployManager } from './win10DeployManager';
 import { DOCKUR_MIRROR_CATALOG } from './dockurEngine';
+import { evaluateWin10BaseBuildEligibility } from './win10BasePreinstaller';
+import { buildWindowsAutounattendXml, buildCredentialSyncScript } from './winAutounattend';
 
 test('Win10DeployManager executes full Phase A sequence and becomes Ready only after all steps succeed', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'win10-deploy-ok-'));
@@ -234,4 +236,90 @@ test('Phase B Gate: VmManager rejects Windows 10 VM creation if Phase A is not r
       (err.code === 'RAM_LIMIT_90_EXCEEDED' || err.code === 'INSUFFICIENT_HOST_RAM')
   );
 });
+
+test('evaluateWin10BaseBuildEligibility enforces all 7 gate outcomes accurately', () => {
+  const baseParams = {
+    alreadyExists: false,
+    installerReady: true,
+    isMemoryBackedOverlay: false,
+    hostTotalMb: 24 * 1024,
+    freeDiskBytes: 30 * 1024 * 1024 * 1024,
+    hasQemu: true,
+    hasOvmf: true,
+    hasGenisoimage: true,
+    ramAllowed: true,
+    cpuThrottled: false,
+  };
+
+  const readyRes = evaluateWin10BaseBuildEligibility({ ...baseParams, alreadyExists: true });
+  assert.equal(readyRes.eligible, false);
+  if (!readyRes.eligible) assert.equal(readyRes.code, 'ALREADY_READY');
+
+  const waitRes = evaluateWin10BaseBuildEligibility({ ...baseParams, installerReady: false });
+  assert.equal(waitRes.eligible, false);
+  if (!waitRes.eligible) assert.equal(waitRes.code, 'WAIT_FOR_ISO');
+
+  const overlayRes = evaluateWin10BaseBuildEligibility({
+    ...baseParams,
+    isMemoryBackedOverlay: true,
+    hostTotalMb: 12 * 1024,
+  });
+  assert.equal(overlayRes.eligible, false);
+  if (!overlayRes.eligible) assert.equal(overlayRes.code, 'SKIPPED_OVERLAY_RAM_LIMIT');
+
+  // >= 20 GiB RAM overlayfs IS eligible
+  const bigOverlayRes = evaluateWin10BaseBuildEligibility({
+    ...baseParams,
+    isMemoryBackedOverlay: true,
+    hostTotalMb: 24 * 1024,
+  });
+  assert.equal(bigOverlayRes.eligible, true);
+
+  const lowDiskRes = evaluateWin10BaseBuildEligibility({
+    ...baseParams,
+    freeDiskBytes: 10 * 1024 * 1024 * 1024,
+  });
+  assert.equal(lowDiskRes.eligible, false);
+  if (!lowDiskRes.eligible) assert.equal(lowDiskRes.code, 'SKIPPED_LOW_DISK');
+
+  const missingToolsRes = evaluateWin10BaseBuildEligibility({ ...baseParams, hasGenisoimage: false });
+  assert.equal(missingToolsRes.eligible, false);
+  if (!missingToolsRes.eligible) assert.equal(missingToolsRes.code, 'SKIPPED_MISSING_TOOLS');
+
+  const ramDeferredRes = evaluateWin10BaseBuildEligibility({ ...baseParams, ramAllowed: false });
+  assert.equal(ramDeferredRes.eligible, false);
+  if (!ramDeferredRes.eligible) assert.equal(ramDeferredRes.code, 'DEFERRED_RESOURCES');
+
+  const cpuDeferredRes = evaluateWin10BaseBuildEligibility({ ...baseParams, cpuThrottled: true });
+  assert.equal(cpuDeferredRes.eligible, false);
+  if (!cpuDeferredRes.eligible) assert.equal(cpuDeferredRes.code, 'DEFERRED_RESOURCES');
+
+  const okRes = evaluateWin10BaseBuildEligibility(baseParams);
+  assert.equal(okRes.eligible, true);
+});
+
+test('buildWindowsAutounattendXml and buildCredentialSyncScript configure sealed base clone sync cleanly', () => {
+  const xml = buildWindowsAutounattendXml({
+    osId: 'windows-10',
+    username: 'Administrator',
+    password: 'Strong&Pwd<2026>',
+    computerName: 'MOONBASE10',
+    wimIndex: 2,
+    installCredSyncTask: true,
+    shutdownAfterFirstLogon: true,
+  });
+
+  assert.ok(xml.includes('<Value>2</Value>'));
+  assert.ok(xml.includes('Strong&amp;Pwd&lt;2026&gt;'));
+  assert.ok(xml.includes('MoonStudioCredSync'));
+  assert.ok(xml.includes('sync-cred.cmd'));
+  assert.ok(xml.includes('shutdown /s /t 5'));
+
+  const syncScript = buildCredentialSyncScript('MoonUser', 'Pass"2026');
+  assert.ok(syncScript.includes('net user "MoonUser" "Pass""2026"'));
+  assert.ok(syncScript.includes('net localgroup Administrators "MoonUser" /add'));
+  assert.ok(syncScript.includes('fDenyTSConnections'));
+  assert.ok(syncScript.includes('remote desktop'));
+});
+
 

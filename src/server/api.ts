@@ -13,6 +13,7 @@ import { registryStore } from './registryStore';
 import { createManagementRouter } from './managementApi';
 import { sanitizePublicRecord } from './credentialPolicy';
 import { win10DeployManager } from './win10DeployManager';
+import { win10BasePreinstaller } from './win10BasePreinstaller';
 
 const upload = multer({
   dest: '/tmp/uploads/',
@@ -83,6 +84,7 @@ apiRouter.get('/win10-installer/status', (_req: Request, res: Response) => {
     success: true,
     installer: win10DeployManager.getState(),
     manifest: win10DeployManager.getPreparedArtifact(),
+    baseImage: win10BasePreinstaller.getState(),
   });
 });
 
@@ -92,6 +94,7 @@ apiRouter.post('/win10-installer/retry', (_req: Request, res: Response) => {
     code: 'WIN10_STARTUP_ONLY',
     error: 'Không thể kích hoạt tải ISO Windows 10 từ frontend. Hệ thống chỉ tự động chuẩn bị ISO trong giai đoạn khởi động server.',
     installer: win10DeployManager.getState(),
+    baseImage: win10BasePreinstaller.getState(),
   });
 });
 

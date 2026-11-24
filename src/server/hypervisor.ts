@@ -8,6 +8,7 @@ import { SupportedOsId } from './imageManager';
 import { resolveOvmfPaths } from './infrastructure';
 import { vncBridgeManager } from './vncBridge';
 import { isMemoryBackedOverlayfs, getContainerMemAvailableBytes } from './dockurEngine';
+import { resolvePersistentStorageRoot } from './storagePath';
 import { NbdIsoServer, NbdSource } from './nbdIsoServer';
 import {
   convertP6PpmToPng,
@@ -64,8 +65,9 @@ export class HypervisorController {
   private tpmDir: string;
 
   constructor() {
-    this.disksDir = path.resolve(process.cwd(), 'data/disks');
-    this.tpmDir = path.resolve(process.cwd(), 'data/tpm');
+    const dataDir = resolvePersistentStorageRoot().dataDir;
+    this.disksDir = path.join(dataDir, 'disks');
+    this.tpmDir = path.join(dataDir, 'tpm');
     try {
       fs.mkdirSync(this.disksDir, { recursive: true });
       fs.mkdirSync(this.tpmDir, { recursive: true });
@@ -134,14 +136,16 @@ export class HypervisorController {
     return diskPath;
   }
 
-  private prepareOvmfNvram(vmId: string): { codePath: string; nvramPath: string } {
+  private prepareOvmfNvram(vmId: string, osId?: SupportedOsId): { codePath: string; nvramPath: string } {
     const ovmf = resolveOvmfPaths();
     if (!ovmf.codePath || !ovmf.varsPath) {
       throw new Error('UEFI OVMF firmware (OVMF_CODE_4M.fd / OVMF_VARS_4M.fd) is not installed on host.');
     }
     const nvramPath = path.join(this.disksDir, `${vmId}-OVMF_VARS.fd`);
     if (!fs.existsSync(nvramPath)) {
-      fs.copyFileSync(ovmf.varsPath, nvramPath);
+      const baseVars = osId === 'windows-10' ? path.join(this.disksDir, 'windows-10-base-OVMF_VARS.fd') : '';
+      const srcVars = baseVars && fs.existsSync(baseVars) ? baseVars : ovmf.varsPath;
+      fs.copyFileSync(srcVars, nvramPath);
     }
     return { codePath: ovmf.codePath, nvramPath };
   }
@@ -456,7 +460,7 @@ export class HypervisorController {
       // - Network: Intel e1000e (inbox driver) or VirtIO-net
       // - Display: Standard VGA + VNC
       // - Input: USB EHCI + USB Tablet
-      const ovmfFiles = this.prepareOvmfNvram(vmId);
+      const ovmfFiles = this.prepareOvmfNvram(vmId, osId);
       nvramPath = ovmfFiles.nvramPath;
       tpmHandle = await this.startSwtpm(vmId);
 
@@ -529,15 +533,7 @@ export class HypervisorController {
         );
         serverLogger.info('Hypervisor', `Attached Windows 10 installation ISO: ${cdromFileSpec}`, vmId);
 
-        if (autounattendIsoPath && fs.existsSync(autounattendIsoPath)) {
-          args.push(
-            '-drive', `id=cdrom1,file=${autounattendIsoPath},media=cdrom,readonly=on,if=none`,
-            '-device', 'ide-cd,drive=cdrom1,bus=ahci.2'
-          );
-          serverLogger.info('Hypervisor', `Attached Windows 10 Autounattend ISO: ${autounattendIsoPath}`, vmId);
-        }
-
-        const virtioIsoPath = path.resolve(process.cwd(), 'data/iso/virtio-win.iso');
+        const virtioIsoPath = path.join(resolvePersistentStorageRoot().dataDir, 'iso', 'virtio-win.iso');
         if (networkModel === 'virtio' && fs.existsSync(virtioIsoPath)) {
           args.push(
             '-drive', `id=cdrom2,file=${virtioIsoPath},media=cdrom,readonly=on,if=none`,
@@ -547,6 +543,14 @@ export class HypervisorController {
         }
       } else {
         serverLogger.info('Hypervisor', `Booting Windows 10 directly from persistent QCOW2 disk: ${diskPath}`, vmId);
+      }
+
+      if (autounattendIsoPath && fs.existsSync(autounattendIsoPath)) {
+        args.push(
+          '-drive', `id=cdrom1,file=${autounattendIsoPath},media=cdrom,readonly=on,if=none`,
+          '-device', 'ide-cd,drive=cdrom1,bus=ahci.2'
+        );
+        serverLogger.info('Hypervisor', `Attached Windows 10 provisioning ISO: ${autounattendIsoPath}`, vmId);
       }
     } else if (osId === 'windows-7') {
       // Windows 7 SP1 Profile:

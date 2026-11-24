@@ -9,7 +9,16 @@ import './src/server/credentialPolicy';
 
 async function startServer() {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+  const portArgIdx = process.argv.indexOf('--port');
+  const cliPort =
+    portArgIdx !== -1 && process.argv[portArgIdx + 1]
+      ? parseInt(process.argv[portArgIdx + 1], 10)
+      : NaN;
+  const PORT = Number.isFinite(cliPort) && cliPort > 0
+    ? cliPort
+    : process.env.PORT
+    ? parseInt(process.env.PORT, 10)
+    : 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
   // Ensure Bot-to-API shared secret is provisioned on startup

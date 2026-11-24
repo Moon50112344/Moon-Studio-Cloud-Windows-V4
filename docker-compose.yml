@@ -5,15 +5,17 @@ services:
       dockerfile: Dockerfile
       target: runtime
       args:
-        DOWNLOAD_WIN10: "false"
+        DOWNLOAD_WIN10: "true"
         DOWNLOAD_WIN7: "false"
+        PREINSTALL_WIN10: "false"
     container_name: moon-cloud-windows
     environment:
-      PORT: "3000"
+      PORT: "8080"
       KVM: "N"
       ACCEL: "tcg"
     ports:
-      - "3000:3000"
+      - "8080:8080"
+      - "3000:8080"
     volumes:
       - ./data:/app/data
     restart: unless-stopped

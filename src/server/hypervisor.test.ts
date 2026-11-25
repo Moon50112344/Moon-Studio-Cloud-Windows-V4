@@ -180,4 +180,41 @@ test('Hypervisor attaches Windows 7 NBD ISO + Autounattend ISOs with zero failed
   }
 });
 
+test('getWindowsIsoBootKeySchedule schedules Space pulses only for blank Windows 10 ISO installs', async () => {
+  const { getWindowsIsoBootKeySchedule } = await import('./qmpInput');
+
+  const blankWin10Iso = getWindowsIsoBootKeySchedule({
+    osId: 'windows-10',
+    attachInstallerIso: true,
+    diskHasBootableOs: false,
+  });
+  assert.deepEqual(blankWin10Iso.keys, ['spc']);
+  assert.ok(blankWin10Iso.delaysMs.length >= 6);
+  assert.ok(blankWin10Iso.delaysMs[0] >= 1500);
+  assert.ok(blankWin10Iso.delaysMs[blankWin10Iso.delaysMs.length - 1] <= 20000);
+
+  const installedWin10 = getWindowsIsoBootKeySchedule({
+    osId: 'windows-10',
+    attachInstallerIso: true,
+    diskHasBootableOs: true,
+  });
+  assert.deepEqual(installedWin10.delaysMs, []);
+  assert.deepEqual(installedWin10.keys, []);
+
+  const diskOnlyWin10 = getWindowsIsoBootKeySchedule({
+    osId: 'windows-10',
+    attachInstallerIso: false,
+    diskHasBootableOs: false,
+  });
+  assert.deepEqual(diskOnlyWin10.delaysMs, []);
+
+  const win7Iso = getWindowsIsoBootKeySchedule({
+    osId: 'windows-7',
+    attachInstallerIso: true,
+    diskHasBootableOs: false,
+  });
+  assert.deepEqual(win7Iso.delaysMs, []);
+});
+
+
 

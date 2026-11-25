@@ -18,6 +18,7 @@ import {
   buildMouseWheelEvents,
   buildKeyComboEvents,
   mapCharToQcodeCombo,
+  getWindowsIsoBootKeySchedule,
   QmpInputEvent,
   QmpMouseButton,
 } from './qmpInput';
@@ -60,6 +61,7 @@ export class HypervisorController {
   private nativePortBridges: Map<string, { port: number; server: net.Server }> = new Map();
   private qmpLocks: Map<string, Promise<unknown>> = new Map();
   private nbdServers: Map<string, NbdIsoServer> = new Map();
+  private bootKeyTimers: Map<string, NodeJS.Timeout[]> = new Map();
   private qemuInstallPromise: Promise<boolean> | null = null;
   private disksDir: string;
   private tpmDir: string;
@@ -136,14 +138,22 @@ export class HypervisorController {
     return diskPath;
   }
 
-  private prepareOvmfNvram(vmId: string, osId?: SupportedOsId): { codePath: string; nvramPath: string } {
+  private prepareOvmfNvram(
+    vmId: string,
+    osId?: SupportedOsId,
+    options?: { resetBlankNvram?: boolean }
+  ): { codePath: string; nvramPath: string } {
     const ovmf = resolveOvmfPaths();
     if (!ovmf.codePath || !ovmf.varsPath) {
       throw new Error('UEFI OVMF firmware (OVMF_CODE_4M.fd / OVMF_VARS_4M.fd) is not installed on host.');
     }
     const nvramPath = path.join(this.disksDir, `${vmId}-OVMF_VARS.fd`);
-    if (!fs.existsSync(nvramPath)) {
-      const baseVars = osId === 'windows-10' ? path.join(this.disksDir, 'windows-10-base-OVMF_VARS.fd') : '';
+    const resetBlank = Boolean(options?.resetBlankNvram);
+    if (!fs.existsSync(nvramPath) || resetBlank) {
+      const baseVars =
+        osId === 'windows-10' && !resetBlank
+          ? path.join(this.disksDir, 'windows-10-base-OVMF_VARS.fd')
+          : '';
       const srcVars = baseVars && fs.existsSync(baseVars) ? baseVars : ovmf.varsPath;
       fs.copyFileSync(srcVars, nvramPath);
     }
@@ -460,7 +470,9 @@ export class HypervisorController {
       // - Network: Intel e1000e (inbox driver) or VirtIO-net
       // - Display: Standard VGA + VNC
       // - Input: USB EHCI + USB Tablet
-      const ovmfFiles = this.prepareOvmfNvram(vmId, osId);
+      const diskHasBootableOs = this.inspectDiskHasBootableWindowsPartition(diskPath);
+      const resetBlankNvram = attachInstallerIso && !options.baseDiskPath && !diskHasBootableOs;
+      const ovmfFiles = this.prepareOvmfNvram(vmId, osId, { resetBlankNvram });
       nvramPath = ovmfFiles.nvramPath;
       tpmHandle = await this.startSwtpm(vmId);
 
@@ -798,6 +810,7 @@ export class HypervisorController {
       }
       info.status = (code && code !== 0) || classification.oomDetected || (signal && !info.requestedShutdown) ? 'ERROR' : 'STOPPED';
       info.pid = null;
+      this.clearBootKeyTimers(vmId);
       this.stopSwtpmForInfo(info);
       void this.stopNbdForVm(vmId);
     });
@@ -844,7 +857,59 @@ export class HypervisorController {
     info.status = 'RUNNING';
     this.vms.set(vmId, info);
     serverLogger.info('Hypervisor', `QEMU instance online with PID ${child.pid} for ${osId}`, vmId);
+
+    const diskHasBootableOs = osId === 'windows-10' && attachInstallerIso
+      ? this.inspectDiskHasBootableWindowsPartition(diskPath)
+      : false;
+    this.scheduleWindowsIsoBootKeys(vmId, osId, attachInstallerIso, diskHasBootableOs);
+
     return info;
+  }
+
+  private clearBootKeyTimers(vmId: string): void {
+    const existing = this.bootKeyTimers.get(vmId);
+    if (!existing) return;
+    for (const timer of existing) {
+      clearTimeout(timer);
+    }
+    this.bootKeyTimers.delete(vmId);
+  }
+
+  private scheduleWindowsIsoBootKeys(
+    vmId: string,
+    osId: SupportedOsId,
+    attachInstallerIso: boolean,
+    diskHasBootableOs: boolean
+  ): void {
+    this.clearBootKeyTimers(vmId);
+    const schedule = getWindowsIsoBootKeySchedule({
+      osId,
+      attachInstallerIso,
+      diskHasBootableOs,
+    });
+    if (schedule.delaysMs.length === 0 || schedule.keys.length === 0) {
+      return;
+    }
+
+    serverLogger.info(
+      'Hypervisor',
+      `Scheduled unattended UEFI CD-ROM boot key (${schedule.keys.join('+')}) over QMP for ${vmId} (${schedule.delaysMs.length} pulses across ${schedule.delaysMs[schedule.delaysMs.length - 1] / 1000}s).`,
+      vmId
+    );
+
+    const timers: NodeJS.Timeout[] = [];
+    for (const delayMs of schedule.delaysMs) {
+      const t = setTimeout(() => {
+        const current = this.vms.get(vmId);
+        if (!current || current.status !== 'RUNNING' || !current.pid || !this.isPidRunning(current.pid)) {
+          return;
+        }
+        void this.sendKeyCombo(vmId, schedule.keys).catch(() => undefined);
+      }, delayMs);
+      t.unref?.();
+      timers.push(t);
+    }
+    this.bootKeyTimers.set(vmId, timers);
   }
 
   private readCgroupOomControl(): { oomKillDisable: boolean; underOom: boolean; oomKillCount: number } {
@@ -969,6 +1034,7 @@ export class HypervisorController {
    * Graceful ACPI shutdown via QMP
    */
   public async gracefulShutdown(vmId: string): Promise<boolean> {
+    this.clearBootKeyTimers(vmId);
     const info = this.vms.get(vmId);
     if (!info || !info.pid || !this.isPidRunning(info.pid)) {
       this.closeNativePortBridge(vmId);
@@ -1004,6 +1070,7 @@ export class HypervisorController {
   }
 
   public async forceStop(vmId: string): Promise<boolean> {
+    this.clearBootKeyTimers(vmId);
     this.closeNativePortBridge(vmId);
     await this.stopNbdForVm(vmId);
     const info = this.vms.get(vmId);
@@ -1044,6 +1111,7 @@ export class HypervisorController {
 
   public cleanupVmArtifacts(vmId: string): void {
     try {
+      this.clearBootKeyTimers(vmId);
       void this.stopNbdForVm(vmId);
       const vm = this.vms.get(vmId);
       if (vm) {

@@ -310,6 +310,10 @@ test('buildWindowsAutounattendXml and buildCredentialSyncScript configure sealed
   });
 
   assert.ok(xml.includes('<Value>2</Value>'));
+  assert.ok(xml.includes('<ProductKey>'));
+  assert.ok(xml.includes('<Key />'));
+  assert.ok(xml.includes('<SkipAutoActivation>true</SkipAutoActivation>'));
+  assert.ok(xml.includes('<PreventDeviceEncryption>true</PreventDeviceEncryption>'));
   assert.ok(xml.includes('Strong&amp;Pwd&lt;2026&gt;'));
   assert.ok(xml.includes('MoonStudioCredSync'));
   assert.ok(xml.includes('sync-cred.cmd'));

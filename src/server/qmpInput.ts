@@ -245,3 +245,23 @@ export function mapCharToQcodeCombo(ch: string): string[] | null {
   if (!special) return null;
   return special.shift ? ['shift', special.qcode] : [special.qcode];
 }
+
+/**
+ * Schedule of automated Space key presses sent over QMP when booting Windows 10
+ * from the installation ISO on a blank disk, bypassing the 5-second OVMF
+ * "Press any key to boot from CD or DVD..." timeout in headless/unattended installs.
+ */
+export function getWindowsIsoBootKeySchedule(opts: {
+  osId: string;
+  attachInstallerIso: boolean;
+  diskHasBootableOs: boolean;
+}): { delaysMs: number[]; keys: string[] } {
+  if (opts.osId !== 'windows-10' || !opts.attachInstallerIso || opts.diskHasBootableOs) {
+    return { delaysMs: [], keys: [] };
+  }
+  return {
+    delaysMs: [2000, 3500, 5000, 7000, 9000, 11500, 14000, 17000],
+    keys: ['spc'],
+  };
+}
+

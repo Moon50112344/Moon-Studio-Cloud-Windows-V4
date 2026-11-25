@@ -8,6 +8,8 @@ import { resolveOvmfPaths } from './infrastructure';
 import { getAvailableDiskBytes, isMemoryBackedOverlayfs } from './dockurEngine';
 import { generateWindowsPassword } from '../utils/credentials';
 import { buildWindowsAutounattendXml, resolvePreferredWimImageIndex } from './winAutounattend';
+import { hypervisor } from './hypervisor';
+import { buildKeyComboEvents, getWindowsIsoBootKeySchedule } from './qmpInput';
 
 export type Win10BasePreinstallStatus =
   | 'NOT_STARTED'
@@ -348,6 +350,14 @@ export class Win10BasePreinstaller {
       );
 
       const timeoutMs = params.timeoutMs || 150 * 60 * 1000;
+      const bootTimers: NodeJS.Timeout[] = [];
+      const clearBootTimers = () => {
+        while (bootTimers.length > 0) {
+          const t = bootTimers.pop();
+          if (t) clearTimeout(t);
+        }
+      };
+
       await new Promise<void>((resolve, reject) => {
         const proc = spawn('/usr/bin/qemu-system-x86_64', qemuArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
         this.activeQemuProc = proc;
@@ -355,7 +365,25 @@ export class Win10BasePreinstaller {
         proc.stderr?.on('data', (d) => {
           errTail = `${errTail}${d.toString()}`.slice(-800);
         });
+
+        const schedule = getWindowsIsoBootKeySchedule({
+          osId: 'windows-10',
+          attachInstallerIso: true,
+          diskHasBootableOs: false,
+        });
+        const events = buildKeyComboEvents(schedule.keys);
+        for (const delayMs of schedule.delaysMs) {
+          const bt = setTimeout(() => {
+            if (proc.exitCode === null && fs.existsSync(qmpSock) && events.length > 0) {
+              void hypervisor.sendQmpCommand(qmpSock, 'input-send-event', { events }).catch(() => undefined);
+            }
+          }, delayMs);
+          bt.unref?.();
+          bootTimers.push(bt);
+        }
+
         const timer = setTimeout(() => {
+          clearBootTimers();
           try {
             proc.kill('SIGKILL');
           } catch {
@@ -364,10 +392,12 @@ export class Win10BasePreinstaller {
           reject(new Error(`Win10 base pre-install timed out after ${Math.round(timeoutMs / 60000)}m`));
         }, timeoutMs);
         proc.on('error', (err) => {
+          clearBootTimers();
           clearTimeout(timer);
           reject(err);
         });
         proc.on('close', (code) => {
+          clearBootTimers();
           clearTimeout(timer);
           if (code === 0) resolve();
           else reject(new Error(`QEMU base install exited with code ${code}: ${errTail.trim()}`));

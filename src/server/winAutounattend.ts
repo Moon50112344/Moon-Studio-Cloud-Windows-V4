@@ -152,6 +152,10 @@ export function buildWindowsAutounattendXml(opts: {
           '            </ModifyPartition>',
           '            <ModifyPartition wcm:action="add">',
           '              <Order>2</Order>',
+          '              <PartitionID>2</PartitionID>',
+          '            </ModifyPartition>',
+          '            <ModifyPartition wcm:action="add">',
+          '              <Order>3</Order>',
           '              <PartitionID>3</PartitionID>',
           '              <Label>Windows</Label>',
           '              <Letter>C</Letter>',
@@ -173,6 +177,7 @@ export function buildWindowsAutounattendXml(opts: {
           '            <PartitionID>3</PartitionID>',
           '          </InstallTo>',
           '          <WillShowUI>OnError</WillShowUI>',
+          '          <InstallToAvailablePartition>false</InstallToAvailablePartition>',
           '        </OSImage>',
           '      </ImageInstall>',
         ]
@@ -254,10 +259,34 @@ export function buildWindowsAutounattendXml(opts: {
     '    </component>',
     '    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
     ...diskConfigBlock,
+    ...(opts.osId === 'windows-10'
+      ? [
+          '      <DynamicUpdate>',
+          '        <Enable>false</Enable>',
+          '        <WillShowUI>Never</WillShowUI>',
+          '      </DynamicUpdate>',
+          '      <UpgradeData>',
+          '        <Upgrade>false</Upgrade>',
+          '        <WillShowUI>Never</WillShowUI>',
+          '      </UpgradeData>',
+        ]
+      : []),
     '      <UserData>',
     '        <AcceptEula>true</AcceptEula>',
     `        <FullName>${escapedUser}</FullName>`,
     '        <Organization>Moon Studio</Organization>',
+    ...(opts.osId === 'windows-10'
+      ? [
+          '        <ProductKey>',
+          '          <Key />',
+          '        </ProductKey>',
+        ]
+      : [
+          '        <ProductKey>',
+          '          <Key />',
+          '          <WillShowUI>OnError</WillShowUI>',
+          '        </ProductKey>',
+        ]),
     '      </UserData>',
     '    </component>',
     '  </settings>',
@@ -293,6 +322,16 @@ export function buildWindowsAutounattendXml(opts: {
     '    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
     '      <fDenyTSConnections>false</fDenyTSConnections>',
     '    </component>',
+    ...(opts.osId === 'windows-10'
+      ? [
+          '    <component name="Microsoft-Windows-Security-SPP-UX" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
+          '      <SkipAutoActivation>true</SkipAutoActivation>',
+          '    </component>',
+          '    <component name="Microsoft-Windows-TerminalServices-RDP-WinStationExtensions" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
+          '      <UserAuthentication>0</UserAuthentication>',
+          '    </component>',
+        ]
+      : []),
     '    <component name="Networking-MPSSVC-Svc" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
     '      <FirewallGroups>',
     '        <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">',
@@ -310,6 +349,13 @@ export function buildWindowsAutounattendXml(opts: {
     '      <UILanguage>en-US</UILanguage>',
     '      <UserLocale>en-US</UserLocale>',
     '    </component>',
+    ...(opts.osId === 'windows-10'
+      ? [
+          '    <component name="Microsoft-Windows-SecureStartup-FilterDriver" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
+          '      <PreventDeviceEncryption>true</PreventDeviceEncryption>',
+          '    </component>',
+        ]
+      : []),
     '    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">',
     '      <OOBE>',
     '        <HideEULAPage>true</HideEULAPage>',
@@ -318,6 +364,8 @@ export function buildWindowsAutounattendXml(opts: {
           '        <HideLocalAccountScreen>true</HideLocalAccountScreen>',
           '        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>',
           '        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>',
+          '        <SkipUserOOBE>true</SkipUserOOBE>',
+          '        <SkipMachineOOBE>true</SkipMachineOOBE>',
         ]
       : []),
     '        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>',

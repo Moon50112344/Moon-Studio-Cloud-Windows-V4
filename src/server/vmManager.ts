@@ -1357,12 +1357,12 @@ export class VmManager {
         const provIso = path.join(provDir, 'Autounattend.iso');
         const diskProvIso = path.join(provDir, 'PROVISION.iso');
         let autounattendIsoPath: string | undefined =
-          !bootFromDiskOnly && fs.existsSync(provIso)
-            ? provIso
-            : bootFromDiskOnly && fs.existsSync(diskProvIso)
+          bootFromDiskOnly && fs.existsSync(diskProvIso)
             ? diskProvIso
+            : !bootFromDiskOnly && fs.existsSync(provIso)
+            ? provIso
             : undefined;
-        if (!bootFromDiskOnly && !autounattendIsoPath) {
+        if (!bootFromDiskOnly) {
           const effectivePwd =
             this.runtimePasswords.get(vm.id) ||
             (vm.isPolicyManaged ? getDefaultProvisioningPassword() : vm.password);

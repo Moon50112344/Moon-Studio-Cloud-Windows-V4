@@ -239,15 +239,17 @@ export default function App() {
   useEffect(() => {
     if (
       !win10Installer ||
-      (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED') ||
+      win10Installer.status !== 'READY' ||
       win10BaseImage?.status === 'INSTALLING_BASE'
     ) {
+      const intervalMs =
+        win10Installer?.status === 'FAILED' && !win10Installer.autoRetryScheduled ? 5000 : 2500;
       const timer = setInterval(() => {
         fetchWin10InstallerStatus();
-      }, 2500);
+      }, intervalMs);
       return () => clearInterval(timer);
     }
-  }, [win10Installer?.status, win10BaseImage?.status]);
+  }, [win10Installer?.status, win10Installer?.autoRetryScheduled, win10BaseImage?.status]);
 
   // Poll host RAM/CPU telemetry every 5s
   useEffect(() => {
@@ -531,7 +533,19 @@ export default function App() {
               )}
 
               {win10Installer?.error && (
-                <p className="text-[11px] text-red-300 leading-snug">{win10Installer.error}</p>
+                <div className="space-y-1">
+                  <p className="text-[11px] text-red-300 leading-snug">{win10Installer.error}</p>
+                  {win10Installer.remediation && (
+                    <p
+                      data-testid="win10-phase-a-remediation"
+                      className={`text-[11px] leading-snug ${
+                        win10Installer.autoRetryScheduled ? 'text-amber-300' : 'text-[#8a99ad]'
+                      }`}
+                    >
+                      {win10Installer.remediation}
+                    </p>
+                  )}
+                </div>
               )}
 
               <div className="flex items-center justify-between gap-2 pt-0.5">

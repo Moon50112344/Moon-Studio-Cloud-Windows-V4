@@ -9,6 +9,8 @@ import {
   buildDockurContainerSpec,
   inspectDockerfileSetup,
   planPartialIsoAction,
+  isRetryableCurlOutcome,
+  computeCurlRetryDelayMs,
 } from './dockurEngine';
 import { parseMountedPersistentPaths, resolvePersistentStorageRoot } from './storagePath';
 
@@ -154,4 +156,17 @@ test('storagePath detects non-ephemeral persistent volumes and falls back cleanl
   });
   assert.equal(fallback.storageType, 'workspace-data');
   assert.equal(fallback.dataDir, '/tmp/test-moon-ws/data');
+});
+
+test('dockurEngine classifies transient curl/HTTP errors and computes progressive backoff delays', () => {
+  for (const code of [6, 7, 18, 22, 28, 33, 35, 52, 55, 56, 92, -4]) {
+    assert.equal(isRetryableCurlOutcome(code), true, `Expected code ${code} to be retryable`);
+  }
+  assert.equal(isRetryableCurlOutcome(-3), false); // checksum mismatch triggers mirror switch
+  assert.equal(isRetryableCurlOutcome(-2), false); // manual abort
+
+  assert.equal(computeCurlRetryDelayMs(1), 2000);
+  assert.equal(computeCurlRetryDelayMs(2), 4000);
+  assert.equal(computeCurlRetryDelayMs(3), 6000);
+  assert.equal(computeCurlRetryDelayMs(10), 15000);
 });

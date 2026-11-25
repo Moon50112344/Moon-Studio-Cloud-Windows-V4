@@ -27,6 +27,9 @@ interface ImagePreflightItem {
   verifiedAt?: string;
   error?: string;
   remediation?: string;
+  autoRetryScheduled?: boolean;
+  retryCount?: number;
+  nextRetryAt?: string;
 }
 
 interface CreateVmModalProps {
@@ -150,21 +153,29 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
   const selectedMedia = imageStatuses[selectedOs];
   const isDownloadingOrVerifying =
     selectedMedia?.status === 'DOWNLOADING' || selectedMedia?.status === 'VERIFYING';
+  const shouldPollSelectedMedia =
+    isDownloadingOrVerifying ||
+    Boolean(selectedMedia?.status === 'ERROR' && selectedMedia?.autoRetryScheduled);
   const isWin10Preparing =
     selectedOs === 'windows-10' &&
     (!win10Installer ||
       (win10Installer.status !== 'READY' && win10Installer.status !== 'FAILED') ||
       win10BaseImage?.status === 'INSTALLING_BASE');
+  const shouldPollWin10 =
+    selectedOs === 'windows-10' &&
+    (!win10Installer ||
+      win10Installer.status !== 'READY' ||
+      win10BaseImage?.status === 'INSTALLING_BASE');
 
   useEffect(() => {
-    if (!isOpen || (!isDownloadingOrVerifying && !isWin10Preparing)) return;
+    if (!isOpen || (!shouldPollSelectedMedia && !shouldPollWin10)) return;
     const timer = setInterval(() => {
-      if (isDownloadingOrVerifying) void fetchImages();
-      if (isWin10Preparing) void fetchWin10Status();
+      if (shouldPollSelectedMedia) void fetchImages();
+      if (shouldPollWin10) void fetchWin10Status();
       void fetchHostResources();
     }, 2000);
     return () => clearInterval(timer);
-  }, [isOpen, isDownloadingOrVerifying, isWin10Preparing, fetchImages, fetchWin10Status, fetchHostResources]);
+  }, [isOpen, shouldPollSelectedMedia, shouldPollWin10, fetchImages, fetchWin10Status, fetchHostResources]);
 
   if (!isOpen) return null;
 
@@ -325,6 +336,11 @@ export function CreateVmModal({ isOpen, onClose, osList, initialOs, onVmCreated 
                         ? `Chuẩn bị bộ cài khi khởi động server gặp lỗi tại bước ${win10Installer.failedStage || 'trước đó'}: ${win10Installer.error || 'Unknown error'}`
                         : `Đang tự động chuẩn bị nền trong Server Startup (${win10Installer?.progressPercent ?? 0}%). Chờ đạt trạng thái "READY" để tạo máy ảo (Debian 12 vẫn dùng bình thường ngay lúc này).`}
                     </p>
+                    {win10Installer?.status === 'FAILED' && win10Installer.remediation && (
+                      <p className={`text-[11px] font-medium ${win10Installer.autoRetryScheduled ? 'text-amber-300' : 'text-[#8a99ad]'}`}>
+                        {win10Installer.remediation}
+                      </p>
+                    )}
                     {win10BaseImage && (
                       <p className="text-[11px] font-mono text-[#8a99ad]" title={win10BaseImage.message}>
                         Base QCOW2:{' '}

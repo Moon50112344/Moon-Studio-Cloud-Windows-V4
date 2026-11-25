@@ -129,6 +129,8 @@ export class VmManager {
   private provisioningCallbacks: Map<string, VmProvisioningCallbacks> = new Map();
   private runtimePasswords: Map<string, string> = new Map();
   private autoResumeVmIds: Set<string> = new Set();
+  private win10ReadyHandled = false;
+  private win10ReadyInFlight: Promise<void> | null = null;
 
   constructor() {
     const dataDir = resolvePersistentStorageRoot().dataDir;
@@ -236,43 +238,13 @@ export class VmManager {
     void refreshPublicIpv4Async();
 
     // Boot 3/4: Background startup task automatically checks/downloads/verifies/extracts Win10 ISO (non-blocking),
-    // then pre-installs windows-10-base.qcow2 when host storage & 90% RAM budget allow.
+    // with automatic retry on failure; once READY, pre-installs windows-10-base.qcow2 when host budget allows.
+    win10DeployManager.onReady((deployState) => {
+      void this.handleWin10InstallerReady(deployState);
+    });
     win10DeployManager
       .startBackgroundPreparation({ hostReport })
-      .then(async (deployState) => {
-        if (!deployState.ready || deployState.status !== 'READY') return;
-        const snap = this.getResourceSnapshot();
-        const ramEligible = snap.ram.availableForVmMb >= 4096 + 384;
-        const baseState = await win10BasePreinstaller.runStartupPreinstallIfEligible({
-          isoPath: deployState.isoPath,
-          wimIndex: deployState.wimIndex,
-          ramAllowed: ramEligible,
-          cpuThrottled: snap.cpu.throttled,
-        });
-        if (baseState.ready && process.env.DISABLE_AUTO_WIN10_VM !== 'true') {
-          const hasAnyWin10Vm = Array.from(this.vms.values()).some((v) => v.osId === 'windows-10');
-          if (!hasAnyWin10Vm) {
-            const preflight = this.checkProvisioningPreflight('windows-10', 4096, 2);
-            if (preflight.ready) {
-              serverLogger.info(
-                'VMManager',
-                'Windows 10 pre-installed base disk READY — auto-provisioning default Windows 10 VM alongside Debian 12...'
-              );
-              this.createVm({
-                id: 'vm-moon-win10-default',
-                name: 'Windows 10 IoT Enterprise LTSC 2021',
-                osId: 'windows-10',
-                cores: 2,
-                memoryMb: 4096,
-                diskGb: 64,
-                username: 'Administrator',
-              }).catch((err) => {
-                serverLogger.warn('VMManager', `Auto-provision default Win10 VM skipped: ${err}`);
-              });
-            }
-          }
-        }
-      })
+      .then((deployState) => this.handleWin10InstallerReady(deployState))
       .catch((err) => {
         serverLogger.error('Win10DeployBoot', `Startup background preparation error: ${err}`);
       });
@@ -324,6 +296,60 @@ export class VmManager {
     }
 
     this.startBackgroundMonitoring();
+  }
+
+  private async handleWin10InstallerReady(deployState: {
+    ready: boolean;
+    status: string;
+    isoPath: string;
+    wimIndex?: number;
+  }): Promise<void> {
+    if (!deployState.ready || deployState.status !== 'READY') return;
+    if (this.win10ReadyHandled) return;
+    if (this.win10ReadyInFlight) return this.win10ReadyInFlight;
+
+    this.win10ReadyInFlight = (async () => {
+      try {
+        this.win10ReadyHandled = true;
+        const snap = this.getResourceSnapshot();
+        const ramEligible = snap.ram.availableForVmMb >= 4096 + 384;
+        const baseState = await win10BasePreinstaller.runStartupPreinstallIfEligible({
+          isoPath: deployState.isoPath,
+          wimIndex: deployState.wimIndex,
+          ramAllowed: ramEligible,
+          cpuThrottled: snap.cpu.throttled,
+        });
+        if (baseState.ready && process.env.DISABLE_AUTO_WIN10_VM !== 'true') {
+          const hasAnyWin10Vm = Array.from(this.vms.values()).some((v) => v.osId === 'windows-10');
+          if (!hasAnyWin10Vm) {
+            const preflight = this.checkProvisioningPreflight('windows-10', 4096, 2);
+            if (preflight.ready) {
+              serverLogger.info(
+                'VMManager',
+                'Windows 10 pre-installed base disk READY — auto-provisioning default Windows 10 VM alongside Debian 12...'
+              );
+              this.createVm({
+                id: 'vm-moon-win10-default',
+                name: 'Windows 10 IoT Enterprise LTSC 2021',
+                osId: 'windows-10',
+                cores: 2,
+                memoryMb: 4096,
+                diskGb: 64,
+                username: 'Administrator',
+              }).catch((err) => {
+                serverLogger.warn('VMManager', `Auto-provision default Win10 VM skipped: ${err}`);
+              });
+            }
+          }
+        }
+      } catch (err) {
+        this.win10ReadyHandled = false;
+        serverLogger.error('Win10DeployBoot', `Post-ready base preinstall hook error: ${err}`);
+      } finally {
+        this.win10ReadyInFlight = null;
+      }
+    })();
+    return this.win10ReadyInFlight;
   }
 
   public getActiveResourceUsages(): ActiveVmResourceUsage[] {

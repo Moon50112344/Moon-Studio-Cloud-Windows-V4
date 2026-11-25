@@ -497,7 +497,6 @@ export class DockurEngine {
 
     const requiredMarginBytes = 256 * 1024 * 1024;
     const legacyTmpPath = `${destPath}.downloading`;
-    const transientExitCodes = new Set([7, 18, 28, 52, 56, 92]);
     const errors: string[] = [];
 
     for (const mirror of orderedMirrors) {
@@ -626,14 +625,36 @@ export class DockurEngine {
                 try {
                   const downloadedSize = fs.existsSync(mirrorTmpPath) ? fs.statSync(mirrorTmpPath).size : 0;
                   if (downloadedSize < 500 * 1024 * 1024) {
-                    throw new Error(
-                      `Incomplete ISO file (${(downloadedSize / (1024 * 1024)).toFixed(1)} MiB < 500 MiB minimum).`
+                    try {
+                      if (fs.existsSync(mirrorTmpPath)) fs.unlinkSync(mirrorTmpPath);
+                    } catch {
+                      // ignore
+                    }
+                    reject(
+                      Object.assign(
+                        new Error(
+                          `Incomplete ISO file (${(downloadedSize / (1024 * 1024)).toFixed(1)} MiB < 500 MiB minimum).`
+                        ),
+                        { code: -4, aborted: false }
+                      )
                     );
+                    return;
                   }
                   if (mirror.expectedSizeBytes > 0 && Math.abs(downloadedSize - mirror.expectedSizeBytes) > 1024 * 1024) {
-                    throw new Error(
-                      `Incomplete ISO size mismatch: got ${downloadedSize} bytes, expected ${mirror.expectedSizeBytes} bytes.`
+                    try {
+                      if (fs.existsSync(mirrorTmpPath)) fs.unlinkSync(mirrorTmpPath);
+                    } catch {
+                      // ignore
+                    }
+                    reject(
+                      Object.assign(
+                        new Error(
+                          `Incomplete ISO size mismatch: got ${downloadedSize} bytes, expected ${mirror.expectedSizeBytes} bytes.`
+                        ),
+                        { code: -4, aborted: false }
+                      )
                     );
+                    return;
                   }
                   fs.renameSync(mirrorTmpPath, destPath);
                   resolve();
@@ -694,13 +715,14 @@ export class DockurEngine {
               // ignore
             }
           }
-          const canResume = (transientExitCodes.has(errCode) || errCode === 33) && attempt < maxResumeAttempts;
+          const canResume = isRetryableCurlOutcome(errCode) && attempt < maxResumeAttempts;
           if (canResume) {
+            const delayMs = computeCurlRetryDelayMs(attempt);
             serverLogger.warn(
               'DockurEngine',
-              `Transient download interruption (code ${errCode}) on ${mirror.provider}; resuming in 2s...`
+              `Transient download interruption (code ${errCode}) on ${mirror.provider}; retrying in ${(delayMs / 1000).toFixed(0)}s (attempt ${attempt + 1}/${maxResumeAttempts})...`
             );
-            await new Promise((r) => setTimeout(r, 2000));
+            await new Promise((r) => setTimeout(r, delayMs));
             continue;
           }
           errors.push(e.message);
@@ -778,6 +800,17 @@ export function planPartialIsoAction(params: {
     existingBytes: partialBytes,
     reason: `Resuming partial download (${(partialBytes / (1024 * 1024)).toFixed(1)} MiB) via HTTP Range.`,
   };
+}
+
+export const TRANSIENT_CURL_EXIT_CODES = new Set([6, 7, 18, 22, 28, 35, 52, 55, 56, 92]);
+
+export function isRetryableCurlOutcome(exitCode: number): boolean {
+  return TRANSIENT_CURL_EXIT_CODES.has(exitCode) || exitCode === 33 || exitCode === -4;
+}
+
+export function computeCurlRetryDelayMs(attempt: number): number {
+  const safeAttempt = Math.max(1, Math.floor(attempt));
+  return Math.min(15_000, 2_000 * safeAttempt);
 }
 
 export const dockurEngine = new DockurEngine();

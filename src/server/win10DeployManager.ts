@@ -73,12 +73,68 @@ export interface Win10DeployState {
   failedStage?: Win10DeployPhaseStatus;
   error?: string;
   remediation?: string;
+  retryCount?: number;
+  maxAutoRetries?: number;
+  autoRetryScheduled?: boolean;
+  nextRetryAt?: string;
   logs: string[];
+}
+
+export interface Win10AutoRetryDecision {
+  shouldRetry: boolean;
+  delayMs: number;
+  reason: string;
+}
+
+export const WIN10_AUTO_RETRY_BACKOFF_MS = [15_000, 30_000, 60_000, 120_000, 300_000] as const;
+export const WIN10_DEFAULT_MAX_AUTO_RETRIES = 10;
+
+export function evaluateWin10AutoRetryPolicy(params: {
+  errorMessage: string;
+  failedStage: Win10DeployPhaseStatus;
+  retryCount: number;
+  maxAutoRetries?: number;
+}): Win10AutoRetryDecision {
+  const maxRetries = params.maxAutoRetries ?? WIN10_DEFAULT_MAX_AUTO_RETRIES;
+  const msg = params.errorMessage || '';
+
+  if (/INSUFFICIENT_DISK_SPACE|Không đủ dung lượng|ENOSPC/i.test(msg)) {
+    return {
+      shouldRetry: false,
+      delayMs: 0,
+      reason: 'Không đủ dung lượng lưu trữ/RAM khả dụng — cần giải phóng dung lượng trước khi tải lại.',
+    };
+  }
+
+  if (params.retryCount >= maxRetries) {
+    return {
+      shouldRetry: false,
+      delayMs: 0,
+      reason: `Đã đạt giới hạn tự động thử lại (${maxRetries}/${maxRetries}); chờ khởi động lại server.`,
+    };
+  }
+
+  const idx = Math.min(Math.max(0, Math.floor(params.retryCount)), WIN10_AUTO_RETRY_BACKOFF_MS.length - 1);
+  const delayMs = WIN10_AUTO_RETRY_BACKOFF_MS[idx];
+  const isChecksum = /SHA-256|CHECKSUM/i.test(msg);
+
+  return {
+    shouldRetry: true,
+    delayMs,
+    reason: isChecksum
+      ? 'File ISO hỏng đã bị xóa tự động; hệ thống sẽ tự tải lại bản sạch từ nguồn chính thức.'
+      : params.failedStage === 'NOT_PREPARED'
+      ? 'Lỗi chuẩn bị môi trường/apt tạm thời; hệ thống sẽ tự động thử lại.'
+      : 'Gián đoạn tải/chuẩn bị ISO; hệ thống sẽ tự động nối tải lại qua HTTP Range.',
+  };
 }
 
 export interface Win10DeployDependencies {
   rootDir?: string;
   bakedRoot?: string;
+  autoRetryEnabled?: boolean;
+  maxAutoRetries?: number;
+  autoRetryDelayMs?: (retryCount: number, defaultDelayMs: number) => number;
   ensureToolchain?: () => Promise<{ ok: boolean; reason?: string; has7z: boolean; hasQemu: boolean; hasOvmf: boolean }>;
   downloadIso?: (
     destPath: string,
@@ -144,6 +200,10 @@ export class Win10DeployManager {
   private deps: Win10DeployDependencies;
   private state: Win10DeployState;
   private activePromise: Promise<Win10DeployState> | null = null;
+  private autoRetryTimer: NodeJS.Timeout | null = null;
+  private disposed = false;
+  private lastHostReport?: HostInfrastructureReport;
+  private readyListeners: Set<(state: Win10DeployState) => void> = new Set();
 
   constructor(deps: Win10DeployDependencies = {}) {
     this.deps = deps;
@@ -197,6 +257,9 @@ export class Win10DeployManager {
       storageType: this.storageType,
       storageRoot: this.dataDir,
       availableStorageBytes: 0,
+      retryCount: 0,
+      maxAutoRetries: deps.maxAutoRetries ?? WIN10_DEFAULT_MAX_AUTO_RETRIES,
+      autoRetryScheduled: false,
       updatedAt: new Date().toISOString(),
       logs: [],
     };
@@ -243,6 +306,7 @@ export class Win10DeployManager {
   }
 
   private persistState(): void {
+    if (this.disposed) return;
     try {
       fs.mkdirSync(this.installerDir, { recursive: true });
       const tmpState = `${this.statePath}.tmp`;
@@ -420,16 +484,53 @@ export class Win10DeployManager {
     }
   }
 
+  public onReady(listener: (state: Win10DeployState) => void): () => void {
+    this.readyListeners.add(listener);
+    return () => {
+      this.readyListeners.delete(listener);
+    };
+  }
+
+  private emitReady(): void {
+    const snapshot = this.getState();
+    for (const listener of this.readyListeners) {
+      try {
+        listener(snapshot);
+      } catch (err) {
+        serverLogger.warn('Win10DeployBoot', `onReady listener error: ${err}`);
+      }
+    }
+  }
+
+  public clearAutoRetryTimer(): void {
+    if (this.autoRetryTimer) {
+      clearTimeout(this.autoRetryTimer);
+      this.autoRetryTimer = null;
+    }
+  }
+
+  public dispose(): void {
+    this.disposed = true;
+    this.clearAutoRetryTimer();
+    this.readyListeners.clear();
+  }
+
   /**
    * Executed automatically during SERVER STARTUP / APPLICATION BOOT.
    * Deduplicated via in-memory activePromise + PID lockfile.
    * Never blocks Express HTTP server startup.
    */
   public startBackgroundPreparation(options?: { hostReport?: HostInfrastructureReport }): Promise<Win10DeployState> {
+    if (options?.hostReport) {
+      this.lastHostReport = options.hostReport;
+    }
     if (this.activePromise) {
       return this.activePromise;
     }
-    this.activePromise = this.runStartupPreparationPipeline(options?.hostReport).finally(() => {
+    this.clearAutoRetryTimer();
+    this.state.autoRetryScheduled = false;
+    this.state.nextRetryAt = undefined;
+    this.activePromise = this.runStartupPreparationPipeline(options?.hostReport || this.lastHostReport).finally(() => {
       this.activePromise = null;
     });
     return this.activePromise;
@@ -439,11 +540,69 @@ export class Win10DeployManager {
     if (this.activePromise) {
       return this.activePromise;
     }
+    this.clearAutoRetryTimer();
+    this.state.autoRetryScheduled = false;
+    this.state.nextRetryAt = undefined;
     this.state.error = undefined;
     this.state.failedStage = undefined;
     this.state.remediation = undefined;
+    this.setStage('NOT_PREPARED', 0, 'Đang tự động khởi chạy lại chuẩn bị bộ cài Windows 10...');
     this.appendLog('Khởi chạy lại quy trình chuẩn bị bộ cài Windows 10 IoT Enterprise LTSC 2021 (Server Startup Recovery).');
     return this.startBackgroundPreparation(options);
+  }
+
+  private scheduleAutoRetry(failedStage: Win10DeployPhaseStatus, errorMessage: string): void {
+    if (this.disposed || this.deps.autoRetryEnabled === false) return;
+    this.clearAutoRetryTimer();
+
+    const currentRetries = this.state.retryCount ?? 0;
+    const maxRetries = this.deps.maxAutoRetries ?? this.state.maxAutoRetries ?? WIN10_DEFAULT_MAX_AUTO_RETRIES;
+    const policy = evaluateWin10AutoRetryPolicy({
+      errorMessage,
+      failedStage,
+      retryCount: currentRetries,
+      maxAutoRetries: maxRetries,
+    });
+
+    this.state.maxAutoRetries = maxRetries;
+    if (!policy.shouldRetry) {
+      this.state.autoRetryScheduled = false;
+      this.state.nextRetryAt = undefined;
+      this.state.remediation = policy.reason;
+      this.persistState();
+      return;
+    }
+
+    const effectiveDelayMs = Math.max(
+      1,
+      this.deps.autoRetryDelayMs
+        ? this.deps.autoRetryDelayMs(currentRetries, policy.delayMs)
+        : policy.delayMs
+    );
+    const nextAttemptNumber = currentRetries + 1;
+    const nextRetryAt = new Date(Date.now() + effectiveDelayMs).toISOString();
+    const delayLabel =
+      effectiveDelayMs >= 1000
+        ? `${Math.ceil(effectiveDelayMs / 1000)} giây`
+        : `${effectiveDelayMs}ms`;
+
+    this.state.autoRetryScheduled = true;
+    this.state.nextRetryAt = nextRetryAt;
+    this.state.remediation = `${policy.reason} Hệ thống tự động thử tải lại (lần ${nextAttemptNumber}/${maxRetries}) sau ${delayLabel}.`;
+    this.appendLog(
+      `[Auto-Retry] Lên lịch tự động tải lại Windows 10 (lần ${nextAttemptNumber}/${maxRetries}) sau ${delayLabel} (HTTP Range resume).`,
+      'warn'
+    );
+
+    this.autoRetryTimer = setTimeout(() => {
+      this.autoRetryTimer = null;
+      if (this.disposed || this.isReady()) return;
+      this.state.retryCount = nextAttemptNumber;
+      this.state.autoRetryScheduled = false;
+      this.state.nextRetryAt = undefined;
+      void this.retryPreparation({ hostReport: this.lastHostReport });
+    }, effectiveDelayMs);
+    this.autoRetryTimer.unref?.();
   }
 
   private setStage(
@@ -469,6 +628,7 @@ export class Win10DeployManager {
       this.appendLog(
         `[Startup 4/8] Phát hiện bộ cài Windows 10 IoT Enterprise LTSC 2021 đã READY từ lần khởi động trước (${this.state.isoPath}, SHA-256 verified) — không tải lại, không giải nén lại.`
       );
+      this.emitReady();
       return this.getState();
     }
 
@@ -718,10 +878,13 @@ export class Win10DeployManager {
       fs.renameSync(tmpManifest, this.manifestPath);
 
       // ==================== BOOT STEP 8: READY ====================
+      this.clearAutoRetryTimer();
       this.state.completedAt = now;
       this.state.error = undefined;
       this.state.failedStage = undefined;
       this.state.remediation = undefined;
+      this.state.autoRetryScheduled = false;
+      this.state.nextRetryAt = undefined;
       this.setStage(
         'READY',
         TOTAL_PIPELINE_STAGES,
@@ -729,6 +892,7 @@ export class Win10DeployManager {
         100
       );
       this.appendLog(`[Startup 8/8] Windows installer READY — ${editionLabel} đã sẵn sàng phục vụ tạo máy ảo.`);
+      this.emitReady();
       return this.getState();
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -739,6 +903,7 @@ export class Win10DeployManager {
       this.state.error = msg;
       this.state.remediation = this.suggestRemediation(currentStage, msg);
       this.appendLog(`Startup preparation FAILED tại bước "${currentStage}": ${msg}`, 'error');
+      this.scheduleAutoRetry(currentStage, msg);
       return this.getState();
     } finally {
       this.releaseFileLock();

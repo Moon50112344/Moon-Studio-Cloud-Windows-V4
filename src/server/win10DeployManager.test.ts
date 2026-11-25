@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Win10DeployManager } from './win10DeployManager';
+import { Win10DeployManager, evaluateWin10AutoRetryPolicy } from './win10DeployManager';
 import { DOCKUR_MIRROR_CATALOG } from './dockurEngine';
 import { evaluateWin10BaseBuildEligibility } from './win10BasePreinstaller';
 import { buildWindowsAutounattendXml, buildCredentialSyncScript } from './winAutounattend';
@@ -138,6 +138,7 @@ test('Win10DeployManager rejects corrupt SHA-256 checksum, marks FAILED, and rec
     assert.equal(retryState.status, 'READY');
     assert.equal(retryState.ready, true);
     assert.equal(attempt, 2);
+    mgr.dispose();
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -386,8 +387,125 @@ test('Win10DeployManager restores READY immediately from /opt/moon-studio/win10-
     assert.equal(state.extractedDir, bakedFilesDir);
     await mgr.startBackgroundPreparation();
     assert.equal(downloadedAtRuntime, false);
+    mgr.dispose();
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+
+test('evaluateWin10AutoRetryPolicy retries transient/checksum failures with backoff and blocks disk-full loops', () => {
+  const net0 = evaluateWin10AutoRetryPolicy({
+    errorMessage: 'curl exit code 56: Recv failure',
+    failedStage: 'DOWNLOADING',
+    retryCount: 0,
+  });
+  assert.equal(net0.shouldRetry, true);
+  assert.equal(net0.delayMs, 15_000);
+
+  const net2 = evaluateWin10AutoRetryPolicy({
+    errorMessage: 'curl exit code 22: HTTP 503',
+    failedStage: 'DOWNLOADING',
+    retryCount: 2,
+  });
+  assert.equal(net2.shouldRetry, true);
+  assert.equal(net2.delayMs, 60_000);
+
+  const shaErr = evaluateWin10AutoRetryPolicy({
+    errorMessage: 'Xác minh SHA-256 thất bại cho ISO',
+    failedStage: 'VERIFYING',
+    retryCount: 1,
+  });
+  assert.equal(shaErr.shouldRetry, true);
+  assert.equal(shaErr.delayMs, 30_000);
+
+  const diskFull = evaluateWin10AutoRetryPolicy({
+    errorMessage: 'Không đủ dung lượng lưu trữ để tải & chuẩn bị Windows 10',
+    failedStage: 'DOWNLOADING',
+    retryCount: 0,
+  });
+  assert.equal(diskFull.shouldRetry, false);
+
+  const maxReached = evaluateWin10AutoRetryPolicy({
+    errorMessage: 'curl exit code 28',
+    failedStage: 'DOWNLOADING',
+    retryCount: 10,
+    maxAutoRetries: 10,
+  });
+  assert.equal(maxReached.shouldRetry, false);
+});
+
+test('Win10DeployManager autonomously retries after FAILED download without manual trigger and emits onReady', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'win10-autoretry-'));
+  const expectedSha = DOCKUR_MIRROR_CATALOG['windows-10'][0].sha256!;
+  let downloadAttempts = 0;
+  let readyCallbackCount = 0;
+  let mgr: Win10DeployManager | null = null;
+
+  try {
+    mgr = new Win10DeployManager({
+      rootDir: tmpDir,
+      hasKvm: () => false,
+      isOverlayFs: () => false,
+      getAvailableBytes: () => 40 * 1024 * 1024 * 1024,
+      maxAutoRetries: 3,
+      autoRetryDelayMs: () => 25,
+      ensureToolchain: async () => ({ ok: true, has7z: true, hasQemu: true, hasOvmf: true }),
+      downloadIso: async (destPath) => {
+        downloadAttempts += 1;
+        if (downloadAttempts === 1) {
+          throw new Error('Auto-download exited with code 22: HTTP 503 Service Unavailable');
+        }
+        fs.mkdirSync(path.dirname(destPath), { recursive: true });
+        const fd = fs.openSync(destPath, 'w');
+        fs.ftruncateSync(fd, 600 * 1024 * 1024);
+        fs.closeSync(fd);
+        return {
+          isoPath: destPath,
+          sizeBytes: 600 * 1024 * 1024,
+          expectedSha256: expectedSha,
+          actualSha256: expectedSha,
+          checksumVerified: true,
+          edition: 'Windows 10 IoT Enterprise LTSC 2021 (x64)',
+        };
+      },
+      extractFiles: async (_isoPath, targetDir) => {
+        fs.mkdirSync(targetDir, { recursive: true });
+        fs.writeFileSync(path.join(targetDir, 'setup.exe'), 'ok');
+        return {
+          extractedCount: 1,
+          mode: 'full',
+          wimIndex: 1,
+          wimEdition: 'Windows 10 IoT Enterprise LTSC',
+        };
+      },
+    });
+
+    mgr.onReady((s) => {
+      if (s.ready && s.status === 'READY') readyCallbackCount += 1;
+    });
+
+    const firstResult = await mgr.startBackgroundPreparation();
+    assert.equal(firstResult.status, 'FAILED');
+    assert.equal(firstResult.autoRetryScheduled, true);
+    assert.ok(firstResult.nextRetryAt);
+    assert.equal(readyCallbackCount, 0);
+
+    // Wait for autonomous background retry timer to complete without calling retryPreparation()
+    const deadline = Date.now() + 2000;
+    while (!mgr.isReady() && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+
+    const finalState = mgr.getState();
+    assert.equal(finalState.status, 'READY');
+    assert.equal(finalState.ready, true);
+    assert.equal(finalState.retryCount, 1);
+    assert.equal(finalState.autoRetryScheduled, false);
+    assert.equal(downloadAttempts, 2);
+    assert.equal(readyCallbackCount, 1);
+  } finally {
+    mgr?.dispose();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 

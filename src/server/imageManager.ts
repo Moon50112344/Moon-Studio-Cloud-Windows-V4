@@ -90,6 +90,9 @@ export interface ImageStatus {
   verifiedAt?: string;
   error?: string;
   remediation?: string;
+  autoRetryScheduled?: boolean;
+  retryCount?: number;
+  nextRetryAt?: string;
 }
 
 const MIN_GENUINE_WINDOWS_ISO_BYTES = 500 * 1024 * 1024; // 500 MiB minimum for real Windows installer ISO
@@ -104,6 +107,8 @@ export class ImageManager {
   private downloadProgress: Map<SupportedOsId, { percent: number; downloadedBytes: number; totalBytes: number; provider: string; stage?: 'downloading' | 'verifying' }> = new Map();
   private isoMetadata: Map<SupportedOsId, IsoMetadataEntry> = new Map();
   private inflightEnsures: Map<SupportedOsId, Promise<string>> = new Map();
+  private autoRetryTimers: Map<SupportedOsId, { timer: NodeJS.Timeout; retryCount: number; nextRetryAt: string }> = new Map();
+  private abortedOs: Set<SupportedOsId> = new Set();
 
   constructor() {
     const dataDir = resolvePersistentStorageRoot().dataDir;
@@ -374,6 +379,35 @@ export class ImageManager {
     }
   }
 
+  private getPartialDownloadPaths(filePath: string, osId: SupportedOsId): string[] {
+    const mirrors =
+      osId === 'windows-10' || osId === 'windows-7' ? DOCKUR_MIRROR_CATALOG[osId] : [];
+    return [...mirrors.map((m) => `${filePath}.${m.id}.downloading`), `${filePath}.downloading`];
+  }
+
+  private findPartialDownloadBytes(filePath: string, osId: SupportedOsId): number {
+    let maxBytes = 0;
+    for (const p of this.getPartialDownloadPaths(filePath, osId)) {
+      try {
+        if (fs.existsSync(p)) {
+          const size = fs.statSync(p).size;
+          if (size > maxBytes) maxBytes = size;
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return maxBytes;
+  }
+
+  private clearAutoRetry(osId: SupportedOsId): void {
+    const entry = this.autoRetryTimers.get(osId);
+    if (entry) {
+      clearTimeout(entry.timer);
+      this.autoRetryTimers.delete(osId);
+    }
+  }
+
   public refreshImageStatuses(): void {
     const now = new Date().toISOString();
     for (const [osId, def] of this.catalog.entries()) {
@@ -469,9 +503,9 @@ export class ImageManager {
 
       const fileExists = fs.existsSync(filePath);
       const isoCheck = this.validateWindowsIsoMedia(filePath);
-      const partialPath = `${filePath}.downloading`;
-      const hasPartial = fs.existsSync(partialPath);
-      const partialBytes = hasPartial ? fs.statSync(partialPath).size : 0;
+      const partialBytes = this.findPartialDownloadBytes(filePath, osId);
+      const hasPartial = partialBytes > 0;
+      const retryEntry = this.autoRetryTimers.get(osId);
 
       if (isoCheck.valid) {
         const verified = Boolean(meta?.checksumVerified && meta.sha256Actual);
@@ -524,7 +558,14 @@ export class ImageManager {
           checksumStatus: fileExists ? 'MISMATCH' : 'MISSING',
           sha256Expected: expectedSha256,
           error: meta?.lastError || (fileExists ? isoCheck.reason : undefined),
-          remediation: meta?.lastError || fileExists ? 'Click Retry Download to re-fetch and verify the ISO.' : undefined,
+          remediation: retryEntry
+            ? `Hệ thống đang tự động thử tải lại (lần ${retryEntry.retryCount}/3) qua HTTP Range...`
+            : meta?.lastError || fileExists
+            ? 'Click Retry Download to re-fetch and verify the ISO.'
+            : undefined,
+          autoRetryScheduled: Boolean(retryEntry),
+          retryCount: retryEntry?.retryCount,
+          nextRetryAt: retryEntry?.nextRetryAt,
         });
       }
     }
@@ -556,6 +597,8 @@ export class ImageManager {
   }
 
   public abortActiveDownload(osId: SupportedOsId): boolean {
+    this.abortedOs.add(osId);
+    this.clearAutoRetry(osId);
     const aborted = dockurEngine.abortDownload(osId);
     if (aborted) {
       this.downloadProgress.delete(osId);
@@ -636,13 +679,14 @@ export class ImageManager {
 
   public deleteCachedIso(osId: SupportedOsId): boolean {
     if (osId === 'debian-12') return false;
+    this.abortedOs.add(osId);
+    this.clearAutoRetry(osId);
     if (dockurEngine.isDownloading(osId)) {
       this.abortActiveDownload(osId);
     }
     const filePath = this.resolveIsoPath(osId);
-    const partialPath = `${filePath}.downloading`;
     let removed = false;
-    for (const p of [filePath, partialPath]) {
+    for (const p of [filePath, ...this.getPartialDownloadPaths(filePath, osId)]) {
       if (fs.existsSync(p)) {
         try {
           fs.unlinkSync(p);
@@ -658,12 +702,20 @@ export class ImageManager {
     return removed;
   }
 
-  public startBackgroundDownload(osId: SupportedOsId): { started: boolean; alreadyRunning: boolean; status: ImageStatus; error?: string } {
+  public startBackgroundDownload(
+    osId: SupportedOsId,
+    internalRetryAttempt = 0
+  ): { started: boolean; alreadyRunning: boolean; status: ImageStatus; error?: string } {
     if (osId === 'debian-12') {
       return { started: false, alreadyRunning: false, status: this.getImageStatus(osId) };
     }
     if (dockurEngine.isDownloading(osId) || this.inflightEnsures.has(osId)) {
       return { started: false, alreadyRunning: true, status: this.getImageStatus(osId) };
+    }
+
+    if (internalRetryAttempt === 0) {
+      this.abortedOs.delete(osId);
+      this.clearAutoRetry(osId);
     }
 
     const availBytes = getAvailableDiskBytes(this.isoDir);
@@ -687,16 +739,44 @@ export class ImageManager {
       this.saveIsoMetadata();
     }
 
-    void this.ensureImageReady(osId).catch((err) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.isoMetadata.set(osId, {
-        ...this.isoMetadata.get(osId),
-        checksumVerified: false,
-        lastError: msg,
+    void this.ensureImageReady(osId)
+      .then(() => {
+        this.clearAutoRetry(osId);
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.isoMetadata.set(osId, {
+          ...this.isoMetadata.get(osId),
+          checksumVerified: false,
+          lastError: msg,
+        });
+        this.saveIsoMetadata();
+
+        const maxAutoRetries = 3;
+        const canAutoRetry =
+          !this.abortedOs.has(osId) &&
+          internalRetryAttempt < maxAutoRetries &&
+          !/INSUFFICIENT_DISK_SPACE|cancelled/i.test(msg);
+
+        if (canAutoRetry) {
+          const nextAttempt = internalRetryAttempt + 1;
+          const delayMs = 15_000 * nextAttempt;
+          const nextRetryAt = new Date(Date.now() + delayMs).toISOString();
+          serverLogger.warn(
+            'ImageManager',
+            `Background ISO download for ${osId} failed (${msg}); scheduling auto-retry ${nextAttempt}/${maxAutoRetries} in ${delayMs / 1000}s...`
+          );
+          const timer = setTimeout(() => {
+            this.autoRetryTimers.delete(osId);
+            if (!this.abortedOs.has(osId)) {
+              this.startBackgroundDownload(osId, nextAttempt);
+            }
+          }, delayMs);
+          timer.unref?.();
+          this.autoRetryTimers.set(osId, { timer, retryCount: nextAttempt, nextRetryAt });
+        }
+        this.refreshImageStatuses();
       });
-      this.saveIsoMetadata();
-      this.refreshImageStatuses();
-    });
 
     return { started: true, alreadyRunning: false, status: this.getImageStatus(osId) };
   }

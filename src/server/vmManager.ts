@@ -40,6 +40,16 @@ import {
   buildWindowsAutounattendXml,
   resolvePreferredWimImageIndex,
 } from './winAutounattend';
+import {
+  evaluateVpsRamReduction,
+  measureDebianVpsUsedRamMb,
+  inspectDebianVpsProcesses,
+  cleanVpsUserTempCaches,
+  executeDebianVpsProcessTrim,
+  VPS_RAM_REDUCE_THRESHOLD_PERCENT,
+  VPS_RAM_REDUCE_COOLDOWN_MS,
+  VpsRamReductionEvent,
+} from './vpsRamGuard';
 
 export class ProvisioningGateError extends Error {
   public readonly statusCode: number;
@@ -131,6 +141,9 @@ export class VmManager {
   private autoResumeVmIds: Set<string> = new Set();
   private win10ReadyHandled = false;
   private win10ReadyInFlight: Promise<void> | null = null;
+  private lastVpsRamReductionAt: Map<string, number> = new Map();
+  private lastVpsRamReductionEvent: Map<string, VpsRamReductionEvent> = new Map();
+  private vpsRamReductionInFlight: Map<string, Promise<VpsRamReductionEvent | null>> = new Map();
 
   constructor() {
     const dataDir = resolvePersistentStorageRoot().dataDir;
@@ -1878,6 +1891,168 @@ export class VmManager {
     });
   }
 
+  public measureVmUsedMemoryMb(vmId: string): number {
+    const vm = this.vms.get(vmId);
+    if (!vm) return 0;
+    if (vm.status === 'Stopped' || vm.status === 'Failed') {
+      return 0;
+    }
+
+    if (vm.osId === 'windows-10' || vm.osId === 'windows-7') {
+      const rssMb = hypervisor.getProcessRssMb(vm.id);
+      if (rssMb > 0) {
+        return Math.min(vm.memoryMb, Math.round(rssMb));
+      }
+      return vm.status === 'Installing' || vm.status === 'Booting'
+        ? Math.min(vm.memoryMb, 256)
+        : 0;
+    }
+
+    return measureDebianVpsUsedRamMb(vm.username, vm.memoryMb);
+  }
+
+  public getLastVpsRamReduction(vmId: string): VpsRamReductionEvent | null {
+    return this.lastVpsRamReductionEvent.get(vmId) || null;
+  }
+
+  /**
+   * Monitors and automatically reduces a VPS's own RAM when it reaches >= 95% (95%, 96%+).
+   * Strictly operates per-VPS (never targets the host server quota).
+   */
+  public async evaluateAndReduceVpsRam(
+    vmId: string,
+    overrideMeasuredMb?: number
+  ): Promise<VpsRamReductionEvent | null> {
+    const existing = this.vpsRamReductionInFlight.get(vmId);
+    if (existing) return existing;
+
+    const vm = this.vms.get(vmId);
+    if (!vm || vm.status === 'Stopped' || vm.status === 'Failed') {
+      return null;
+    }
+
+    const usedMemoryMb =
+      typeof overrideMeasuredMb === 'number'
+        ? overrideMeasuredMb
+        : this.measureVmUsedMemoryMb(vmId);
+
+    const lastReducedAtMs = this.lastVpsRamReductionAt.get(vmId);
+    const processCandidates =
+      vm.osId === 'debian-12' ? inspectDebianVpsProcesses(vm.username) : undefined;
+
+    const plan = evaluateVpsRamReduction({
+      vmId: vm.id,
+      osId: vm.osId,
+      allocatedMemoryMb: vm.memoryMb,
+      usedMemoryMb,
+      lastReducedAtMs,
+      cooldownMs: VPS_RAM_REDUCE_COOLDOWN_MS,
+      processCandidates,
+    });
+
+    if (!plan.shouldReduce) {
+      return null;
+    }
+
+    const task = (async (): Promise<VpsRamReductionEvent | null> => {
+      const beforePercent = Math.round(plan.usedPercent);
+      const beforeMb = plan.usedMemoryMb;
+      this.lastVpsRamReductionAt.set(vm.id, Date.now());
+
+      if (vm.osId === 'windows-10' || vm.osId === 'windows-7') {
+        const balloonResult = await hypervisor.reclaimGuestMemoryViaBalloon(
+          vm.id,
+          plan.targetMemoryMb
+        );
+        if (vm.installCompleted) {
+          await hypervisor.ejectCdromDrive(vm.id, 'cdrom0');
+          await hypervisor.ejectCdromDrive(vm.id, 'cdrom1');
+          this.reclaimUnusedIsoMemory(vm.osId);
+        }
+        cleanVpsUserTempCaches(vm.username);
+
+        const afterMeasured = this.measureVmUsedMemoryMb(vm.id);
+        const afterMb =
+          typeof balloonResult.afterActualMb === 'number' && balloonResult.afterActualMb > 0
+            ? Math.min(beforeMb, balloonResult.afterActualMb)
+            : afterMeasured > 0 && afterMeasured < beforeMb
+            ? afterMeasured
+            : beforeMb;
+        const reducedMb = Math.max(0, Math.round(beforeMb - afterMb));
+        const afterPercent = Math.min(100, Math.round((afterMb / vm.memoryMb) * 100));
+
+        const actionLabel = balloonResult.ok
+          ? `VirtIO Balloon thu hồi RAM khách về mức ${plan.targetMemoryMb} MB`
+          : `Giải phóng bộ nhớ đệm & ổ đĩa tạm cho ${vm.osName} (chờ VirtIO Balloon driver)`;
+
+        const event: VpsRamReductionEvent = {
+          vmId: vm.id,
+          osId: vm.osId,
+          beforeMb,
+          afterMb,
+          allocatedMemoryMb: vm.memoryMb,
+          beforePercent,
+          afterPercent,
+          reducedMb,
+          strategy: balloonResult.ok ? 'qemu-balloon' : 'cache-and-media-reclaim',
+          action: actionLabel,
+          terminatedProcesses: [],
+          timestamp: new Date().toISOString(),
+        };
+        this.lastVpsRamReductionEvent.set(vm.id, event);
+        serverLogger.warn(
+          'VPS-RAM-Guard',
+          `RAM VPS ${vm.name} (${vm.id}) đạt ${plan.usedPercent}% (>= ${VPS_RAM_REDUCE_THRESHOLD_PERCENT}%): ${actionLabel} (${beforeMb} MB -> ${afterMb} MB, -${reducedMb} MB).`,
+          vm.id
+        );
+        return event;
+      }
+
+      // Debian 12 VPS: clean user caches + terminate runaway non-host VPS user processes
+      cleanVpsUserTempCaches(vm.username);
+      const terminated = executeDebianVpsProcessTrim(plan.processesToTrim);
+      if (terminated.length > 0) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const afterMb = this.measureVmUsedMemoryMb(vm.id);
+      const reducedMb = Math.max(0, Math.round(beforeMb - afterMb));
+      const afterPercent = Math.min(100, Math.round((afterMb / vm.memoryMb) * 100));
+      const procSummary =
+        terminated.length > 0
+          ? `Dọn cache & dừng ${terminated.length} tiến trình ngốn RAM trong VPS (${terminated.map((p) => p.comm).join(', ')})`
+          : 'Dọn bộ nhớ đệm phiên người dùng Debian 12 VPS';
+
+      const event: VpsRamReductionEvent = {
+        vmId: vm.id,
+        osId: vm.osId,
+        beforeMb,
+        afterMb,
+        allocatedMemoryMb: vm.memoryMb,
+        beforePercent,
+        afterPercent,
+        reducedMb,
+        strategy: 'vps-process-trim',
+        action: procSummary,
+        terminatedProcesses: terminated,
+        timestamp: new Date().toISOString(),
+      };
+      this.lastVpsRamReductionEvent.set(vm.id, event);
+      serverLogger.warn(
+        'VPS-RAM-Guard',
+        `RAM VPS ${vm.name} (${vm.id}) đạt ${plan.usedPercent}% (>= ${VPS_RAM_REDUCE_THRESHOLD_PERCENT}%): ${procSummary} (${beforeMb} MB -> ${afterMb} MB, -${reducedMb} MB).`,
+        vm.id
+      );
+      return event;
+    })();
+
+    this.vpsRamReductionInFlight.set(vmId, task);
+    return task.finally(() => {
+      if (this.vpsRamReductionInFlight.get(vmId) === task) {
+        this.vpsRamReductionInFlight.delete(vmId);
+      }
+    });
+  }
+
   public renameVm(vmId: string, newName: string): VmRecord | undefined {
     const vm = this.vms.get(vmId);
     if (!vm) return undefined;
@@ -2085,6 +2260,13 @@ export class VmManager {
             await hypervisor.ejectCdromDrive(vm.id, 'cdrom1');
             this.reclaimUnusedIsoMemory(vm.osId);
           }
+        }
+
+        // Per-VPS automatic RAM reduction check (>= 95%) for all active VMs
+        if (vm.status === 'Ready' || vm.status === 'Running' || vm.status === 'Installing' || vm.status === 'Booting') {
+          await this.evaluateAndReduceVpsRam(vm.id).catch((err) => {
+            serverLogger.warn('VPS-RAM-Guard', `Auto-reduce check error for ${vm.id}: ${err}`, vm.id);
+          });
         }
       }
     }, 15000);

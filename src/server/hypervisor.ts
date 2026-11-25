@@ -28,6 +28,7 @@ import {
   ExitCauseCode,
   parseCgroupOomControl,
 } from './win7Lifecycle';
+import { readPidRssMb } from './vpsRamGuard';
 
 export interface VmProcessInfo {
   vmId: string;
@@ -532,6 +533,7 @@ export class HypervisorController {
         '-vga', 'std',
         '-device', 'usb-ehci,id=ehci',
         '-device', 'usb-tablet',
+        '-device', 'virtio-balloon-pci,id=balloon0,deflate-on-oom=on',
         '-rtc', 'base=localtime,clock=host',
         '-qmp', `unix:${qmpSocketPath},server,nowait`,
         '-display', 'none',
@@ -605,6 +607,7 @@ export class HypervisorController {
         '-vga', 'std',
         '-usb',
         '-device', 'usb-tablet',
+        '-device', 'virtio-balloon-pci,id=balloon0,deflate-on-oom=on',
         '-rtc', 'base=localtime,clock=host',
         '-qmp', `unix:${qmpSocketPath},server,nowait`,
         '-display', 'none',
@@ -1514,6 +1517,72 @@ export class HypervisorController {
 
   public getVmProcess(vmId: string): VmProcessInfo | undefined {
     return this.vms.get(vmId);
+  }
+
+  /**
+   * Reads real resident RAM (VmRSS in MB) for the VM's QEMU (and swtpm) processes.
+   */
+  public getProcessRssMb(vmId: string): number {
+    const info = this.vms.get(vmId);
+    if (!info || !info.pid || info.pid === process.pid || !this.isPidRunning(info.pid)) {
+      return 0;
+    }
+    let totalMb = readPidRssMb(info.pid);
+    const tpmPid = info.tpmProcessRef?.pid;
+    if (tpmPid && tpmPid !== info.pid && this.isPidRunning(tpmPid)) {
+      totalMb += readPidRssMb(tpmPid);
+    }
+    return Math.round(totalMb * 10) / 10;
+  }
+
+  public async queryBalloonStats(vmId: string): Promise<{ actualMb: number } | null> {
+    const qmpSocketPath = this.resolveQmpSocketPath(vmId);
+    if (!qmpSocketPath) return null;
+    try {
+      const res = (await this.sendQmpCommand(qmpSocketPath, 'query-balloon')) as { actual?: number };
+      if (res && typeof res.actual === 'number' && Number.isFinite(res.actual)) {
+        return { actualMb: Math.round(res.actual / (1024 * 1024)) };
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Shrinks guest physical RAM target via QEMU QMP virtio-balloon when VPS RAM reaches >= 95%.
+   */
+  public async reclaimGuestMemoryViaBalloon(
+    vmId: string,
+    targetMemoryMb: number
+  ): Promise<{ ok: boolean; beforeActualMb?: number; afterActualMb?: number; error?: string }> {
+    const qmpSocketPath = this.resolveQmpSocketPath(vmId);
+    if (!qmpSocketPath) {
+      return { ok: false, error: 'QMP socket unavailable' };
+    }
+    const before = await this.queryBalloonStats(vmId);
+    const targetBytes = Math.max(256, Math.round(targetMemoryMb)) * 1024 * 1024;
+    try {
+      await this.sendQmpCommand(qmpSocketPath, 'balloon', { value: targetBytes });
+      const after = await this.queryBalloonStats(vmId);
+      serverLogger.info(
+        'Hypervisor',
+        `[VPS-RAM-Guard] QMP virtio-balloon adjusted VM ${vmId} target to ${targetMemoryMb}MB (before=${before?.actualMb ?? 'n/a'}MB, after=${after?.actualMb ?? 'n/a'}MB).`,
+        vmId
+      );
+      return {
+        ok: true,
+        beforeActualMb: before?.actualMb,
+        afterActualMb: after?.actualMb,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        ok: false,
+        beforeActualMb: before?.actualMb,
+        error: message,
+      };
+    }
   }
 
   private isPidRunning(pid: number): boolean {

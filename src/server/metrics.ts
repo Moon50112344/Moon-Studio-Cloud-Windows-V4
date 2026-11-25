@@ -1,6 +1,10 @@
 import os from 'node:os';
 import { vmManager } from './vmManager';
 import { hostResourceManager } from './resourceManager';
+import {
+  VPS_RAM_REDUCE_THRESHOLD_PERCENT,
+  VpsRamReductionEvent,
+} from './vpsRamGuard';
 
 export interface MetricSample {
   time: string;
@@ -19,6 +23,9 @@ export interface VmMetricsResponse {
   memoryMb: number;
   totalMemoryMb: number;
   memoryPercent: number;
+  autoRamReduceEnabled: boolean;
+  autoRamReduceThresholdPercent: number;
+  lastAutoRamReduction: VpsRamReductionEvent | null;
   uptimeSeconds: number;
   timestamp: string;
   history: MetricSample[];
@@ -40,27 +47,23 @@ export class VmMetricsCollector {
   private seedInitialHistory(): void {
     const now = Date.now();
     const defaultHistory: MetricSample[] = [];
+    const baseMemMb = 140;
+    const baseTotalMb = 2048;
+    const baseMemPct = Math.round((baseMemMb / baseTotalMb) * 100);
 
-    const totalMem = Math.round(os.totalmem() / 1024 / 1024);
-    const freeMem = Math.round(os.freemem() / 1024 / 1024);
-    const baseUsed = Math.max(200, totalMem - freeMem);
-    const baseMemPct = Math.min(95, Math.round((baseUsed / totalMem) * 100));
-
-    // Generate 12 baseline points
+    // Generate 12 baseline points aligned with lightweight VPS session memory
     for (let i = 12; i >= 1; i--) {
       const pointTime = new Date(now - i * 3000);
       const timeStr = pointTime.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      const jitter = (Math.sin(i) * 3);
-      const cpu = Math.max(2, Math.min(95, Math.round(8 + jitter)));
-      const memory = Math.max(10, Math.min(95, Math.round(baseMemPct + (jitter * 0.5))));
-      const memoryMb = Math.round((memory / 100) * 2048);
+      const jitter = Math.sin(i) * 2;
+      const cpu = Math.max(1, Math.min(95, Math.round(6 + jitter)));
 
       defaultHistory.push({
         time: timeStr,
         cpu,
-        memory,
-        memoryMb,
-        totalMemoryMb: 2048,
+        memory: baseMemPct,
+        memoryMb: baseMemMb,
+        totalMemoryMb: baseTotalMb,
       });
     }
 
@@ -76,15 +79,28 @@ export class VmMetricsCollector {
     const cores = targetVm ? targetVm.cores : 2;
     const targetTotalMemMb = targetVm ? targetVm.memoryMb : 2048;
 
-    // Real system memory calculation
-    const hostTotalMem = Math.round(os.totalmem() / 1024 / 1024);
-    const hostFreeMem = Math.round(os.freemem() / 1024 / 1024);
-    const hostUsedMem = Math.max(150, hostTotalMem - hostFreeMem);
-    const hostMemRatio = hostUsedMem / hostTotalMem;
+    let memoryMb = 0;
+    if (targetVm) {
+      memoryMb = vmManager.measureVmUsedMemoryMb(targetVm.id);
+    } else {
+      memoryMb = 140;
+    }
 
-    // Scale to VM's allocated RAM
-    const memoryMb = Math.min(targetTotalMemMb, Math.max(120, Math.round(targetTotalMemMb * hostMemRatio)));
-    const memoryPercent = Math.min(100, Math.max(5, Math.round((memoryMb / targetTotalMemMb) * 100)));
+    const memoryPercent =
+      targetVm && (targetVm.status === 'Stopped' || targetVm.status === 'Failed')
+        ? 0
+        : Math.min(100, Math.max(1, Math.round((memoryMb / Math.max(1, targetTotalMemMb)) * 100)));
+
+    if (
+      targetVm &&
+      memoryPercent >= VPS_RAM_REDUCE_THRESHOLD_PERCENT &&
+      (targetVm.status === 'Ready' ||
+        targetVm.status === 'Running' ||
+        targetVm.status === 'Installing' ||
+        targetVm.status === 'Booting')
+    ) {
+      void vmManager.evaluateAndReduceVpsRam(targetVm.id, memoryMb);
+    }
 
     const cpuPercent = this.getCpuUsage();
     const nowTimeStr = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -117,6 +133,9 @@ export class VmMetricsCollector {
       memoryMb,
       totalMemoryMb: targetTotalMemMb,
       memoryPercent,
+      autoRamReduceEnabled: true,
+      autoRamReduceThresholdPercent: VPS_RAM_REDUCE_THRESHOLD_PERCENT,
+      lastAutoRamReduction: targetVm ? vmManager.getLastVpsRamReduction(targetVm.id) : null,
       uptimeSeconds: Math.round(os.uptime()),
       timestamp: new Date().toISOString(),
       history,

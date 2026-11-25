@@ -18,6 +18,20 @@ interface MetricPoint {
   totalMemoryMb: number;
 }
 
+interface VpsRamReductionEvent {
+  vmId: string;
+  osId: string;
+  beforeMb: number;
+  afterMb: number;
+  allocatedMemoryMb: number;
+  beforePercent: number;
+  afterPercent: number;
+  reducedMb: number;
+  strategy: string;
+  action: string;
+  timestamp: string;
+}
+
 interface VmMetricsData {
   success: boolean;
   vmId: string;
@@ -27,6 +41,9 @@ interface VmMetricsData {
   memoryMb: number;
   totalMemoryMb: number;
   memoryPercent: number;
+  autoRamReduceEnabled?: boolean;
+  autoRamReduceThresholdPercent?: number;
+  lastAutoRamReduction?: VpsRamReductionEvent | null;
   uptimeSeconds: number;
   timestamp: string;
   history: MetricPoint[];
@@ -78,10 +95,13 @@ export function VmMetricsChart({ vmId, vmName, cores = 2, memoryMb = 2048 }: VmM
   }, [vmId, isLive]);
 
   const latestCpu = data?.cpuPercent ?? 5;
-  const latestMem = data?.memoryPercent ?? 30;
-  const currentMemMb = data?.memoryMb ?? 650;
+  const latestMem = data?.memoryPercent ?? 7;
+  const currentMemMb = data?.memoryMb ?? 140;
   const currentTotalMemMb = data?.totalMemoryMb ?? memoryMb;
   const currentCores = data?.cores ?? cores;
+  const autoReduceThreshold = data?.autoRamReduceThresholdPercent ?? 95;
+  const lastRamReduction = data?.lastAutoRamReduction ?? null;
+  const isVpsRamCritical = latestMem >= autoReduceThreshold;
 
   const chartData = data?.history && data.history.length > 0 ? data.history : [];
 
@@ -182,21 +202,42 @@ export function VmMetricsChart({ vmId, vmName, cores = 2, memoryMb = 2048 }: VmM
         </div>
 
         {/* Memory Card */}
-        <div className="bg-[#0a101d] border border-[#1e2a44] rounded-lg p-3 flex items-center justify-between">
-          <div className="space-y-1">
+        <div
+          data-testid="vps-ram-metrics-card"
+          className={`bg-[#0a101d] border rounded-lg p-3 flex items-center justify-between transition-colors ${
+            isVpsRamCritical ? 'border-amber-500/60' : 'border-[#1e2a44]'
+          }`}
+        >
+          <div className="space-y-1 min-w-0 pr-2">
             <span className="text-[11px] uppercase font-semibold tracking-wider text-[#8a99ad] flex items-center gap-1">
-              <Layers className="w-3.5 h-3.5 text-[#42d6a0]" /> Bộ nhớ RAM (Đã dùng)
+              <Layers className={`w-3.5 h-3.5 ${isVpsRamCritical ? 'text-amber-400' : 'text-[#42d6a0]'}`} />
+              Bộ nhớ RAM (Đã dùng)
             </span>
-            <div className="flex items-baseline gap-2">
-              <span className="text-xl sm:text-2xl font-bold font-mono text-[#42d6a0]">
+            <div className="flex items-baseline gap-2 flex-wrap">
+              <span
+                className={`text-xl sm:text-2xl font-bold font-mono ${
+                  isVpsRamCritical ? 'text-amber-400' : 'text-[#42d6a0]'
+                }`}
+              >
                 {latestMem}%
               </span>
               <span className="text-[11px] text-[#8a99ad] font-mono">
                 {currentMemMb} / {currentTotalMemMb} MB
               </span>
             </div>
+            <p className="text-[10px] text-[#8a99ad] truncate" title={lastRamReduction?.action || undefined}>
+              {lastRamReduction
+                ? `Đã giảm RAM VPS: ${lastRamReduction.beforePercent}% → ${lastRamReduction.afterPercent}% (-${lastRamReduction.reducedMb} MB)`
+                : `Tự động giảm RAM VPS khi đạt ${autoReduceThreshold}–96%`}
+            </p>
           </div>
-          <div className="w-12 h-12 rounded-full border-2 border-[#1e2a44] border-t-[#42d6a0] flex items-center justify-center font-mono text-[11px] text-[#42d6a0] font-bold">
+          <div
+            className={`w-12 h-12 shrink-0 rounded-full border-2 border-[#1e2a44] flex items-center justify-center font-mono text-[11px] font-bold ${
+              isVpsRamCritical
+                ? 'border-t-amber-400 text-amber-400'
+                : 'border-t-[#42d6a0] text-[#42d6a0]'
+            }`}
+          >
             {latestMem}%
           </div>
         </div>
